@@ -52,3 +52,6 @@ outputs/
 # OS files
 .DS_Store
 Thumbs.db
+
+# noise
+backbone_compare/

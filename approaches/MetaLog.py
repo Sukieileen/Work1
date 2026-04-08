@@ -1,5 +1,6 @@
 import sys
 sys.path.extend([".", ".."])
+import csv
 from CONSTANTS import *
 from sklearn.decomposition import FastICA
 from representations.templates.statistics import Simple_template_TF_IDF, Template_TF_IDF_without_clean
@@ -12,6 +13,12 @@ from module.Common import data_iter, generate_tinsts_binary_label
 from models.gru import AttGRUModel
 from models.mamba import AttBiMambaModel
 from utils.Vocab import Vocab
+
+try:
+    from sklearn.metrics import average_precision_score, roc_auc_score
+except ImportError:
+    average_precision_score = None
+    roc_auc_score = None
 
 
 lstm_hiddens = 100
@@ -33,6 +40,22 @@ def sanitize_probs(tag_logits):
     tag_probs = torch.nan_to_num(tag_probs, nan=0.5, posinf=1.0, neginf=0.0)
     tag_probs = torch.clamp(tag_probs, min=1e-6, max=1 - 1e-6)
     return tag_probs
+
+
+def append_epoch_metrics(csv_file, row):
+    fieldnames = [
+        'backbone', 'epoch', 'selected_threshold', 'dev_f1', 'precision', 'recall', 'f1', 'auroc', 'aucpr',
+        'selected_for_best'
+    ]
+    output_dir = os.path.dirname(csv_file)
+    if output_dir and not os.path.exists(output_dir):
+        os.makedirs(output_dir)
+    write_header = not os.path.exists(csv_file)
+    with open(csv_file, 'a', encoding='utf-8', newline='') as writer:
+        csv_writer = csv.DictWriter(writer, fieldnames=fieldnames)
+        if write_header:
+            csv_writer.writeheader()
+        csv_writer.writerow(row)
 
 
 def get_updated_network(old, new, lr, load=False):
@@ -91,13 +114,14 @@ class MetaLog:
     def logger(self):
         return MetaLog._logger
 
-    def __init__(self, vocab, num_layer, hidden_size, label2id, backbone='gru', mamba_state=64,
+    def __init__(self, vocab, num_layer, hidden_size, label2id, backbone='gru', dropout=0.0, mamba_state=64,
                  mamba_conv=4, mamba_expand=2, mamba_variant='auto'):
         self.label2id = label2id
         self.vocab = vocab
         self.num_layer = num_layer
         self.hidden_size = hidden_size
         self.backbone = backbone.lower()
+        self.dropout = dropout
         self.mamba_state = mamba_state
         self.mamba_conv = mamba_conv
         self.mamba_expand = mamba_expand
@@ -113,12 +137,13 @@ class MetaLog:
 
     def _build_model(self):
         if self.backbone == 'gru':
-            return AttGRUModel(self.vocab, self.num_layer, self.hidden_size)
+            return AttGRUModel(self.vocab, self.num_layer, self.hidden_size, dropout=self.dropout)
         if self.backbone == 'bimamba':
             return AttBiMambaModel(
                 self.vocab,
                 self.num_layer,
                 self.hidden_size,
+                dropout=self.dropout,
                 mamba_state=self.mamba_state,
                 mamba_conv=self.mamba_conv,
                 mamba_expand=self.mamba_expand,
@@ -197,6 +222,23 @@ class MetaLog:
             'fpr': fpr,
         }
 
+    def _ranking_metrics_from_scores(self, gold_labels, anomaly_scores):
+        ranking_metrics = {
+            'auroc': float('nan'),
+            'aucpr': float('nan'),
+        }
+        if roc_auc_score is None or average_precision_score is None:
+            return ranking_metrics
+        try:
+            ranking_metrics['auroc'] = 100 * roc_auc_score(gold_labels, anomaly_scores)
+        except ValueError:
+            pass
+        try:
+            ranking_metrics['aucpr'] = 100 * average_precision_score(gold_labels, anomaly_scores)
+        except ValueError:
+            pass
+        return ranking_metrics
+
     def _log_metrics(self, metrics):
         self.logger.info('TP: %d, TN: %d, FN: %d, FP: %d' %
                          (metrics['TP'], metrics['TN'], metrics['FN'], metrics['FP']))
@@ -216,6 +258,8 @@ class MetaLog:
             )
         else:
             self.logger.info('Precision is 0 and therefore f is 0')
+        if 'auroc' in metrics and 'aucpr' in metrics:
+            self.logger.info('AUROC = %.4f, AUCPR = %.4f' % (metrics['auroc'], metrics['aucpr']))
 
     def tune_threshold(self, instances, vocab, threshold_min=0.1, threshold_max=0.9, threshold_step=0.01,
                        split_name='dev'):
@@ -249,10 +293,17 @@ class MetaLog:
         if vocab is None:
             vocab = self.vocab
         self.logger.info('Start evaluating by threshold %.3f' % threshold)
-        anomaly_scores, gold_labels = self.collect_anomaly_scores(instances, vocab)
-        metrics = self._binary_metrics_from_scores(gold_labels, anomaly_scores, threshold)
+        metrics = self.evaluate_metrics(instances, threshold=threshold, vocab=vocab)
         self._log_metrics(metrics)
         return metrics['precision'], metrics['recall'], metrics['f']
+
+    def evaluate_metrics(self, instances, threshold=0.5, vocab=None):
+        if vocab is None:
+            vocab = self.vocab
+        anomaly_scores, gold_labels = self.collect_anomaly_scores(instances, vocab)
+        metrics = self._binary_metrics_from_scores(gold_labels, anomaly_scores, threshold)
+        metrics.update(self._ranking_metrics_from_scores(gold_labels, anomaly_scores))
+        return metrics
 
 
 if __name__ == '__main__':
@@ -288,6 +339,16 @@ if __name__ == '__main__':
                            help="Upper bound for threshold sweep when auto_threshold is enabled.")
     argparser.add_argument('--threshold_step', type=float, default=0.01,
                            help="Step size for threshold sweep when auto_threshold is enabled.")
+    argparser.add_argument('--epoch_metrics_file', type=str, default='',
+                           help="Optional CSV file for per-epoch test metrics.")
+    argparser.add_argument('--model_lr', type=float, default=None,
+                           help="Optional learning rate override.")
+    argparser.add_argument('--epochs', type=int, default=epochs,
+                           help="Number of training epochs.")
+    argparser.add_argument('--dropout', type=float, default=0.0,
+                           help="Dropout used by the sequence encoder.")
+    argparser.add_argument('--run_name', type=str, default='',
+                           help="Optional run name used for model checkpoint files.")
 
     args, extra_args = argparser.parse_known_args()
 
@@ -307,6 +368,11 @@ if __name__ == '__main__':
     threshold_min = args.threshold_min
     threshold_max = args.threshold_max
     threshold_step = args.threshold_step
+    epoch_metrics_file = args.epoch_metrics_file
+    model_lr_override = args.model_lr
+    epochs = args.epochs
+    dropout = args.dropout
+    run_name = args.run_name
 
     # process BGL
     dataset = 'BGL'
@@ -436,6 +502,7 @@ if __name__ == '__main__':
         lstm_hiddens,
         processor_BGL.label2id,
         backbone=backbone,
+        dropout=dropout,
         mamba_state=mamba_state,
         mamba_conv=mamba_conv,
         mamba_expand=mamba_expand,
@@ -443,14 +510,17 @@ if __name__ == '__main__':
     )
 
     # meta learning
-    log = 'backbone={}_layer={}_hidden={}_epoch={}'.format(backbone, num_layer, lstm_hiddens, epochs)
+    if run_name:
+        log = run_name
+    else:
+        log = 'backbone={}_layer={}_hidden={}_epoch={}'.format(backbone, num_layer, lstm_hiddens, epochs)
     best_model_file = os.path.join(output_model_dir, log + '_best.pt')
     last_model_file = os.path.join(output_model_dir, log + '_last.pt')
     if not os.path.exists(output_model_dir):
         os.makedirs(output_model_dir)
     if mode == 'train':
         # Train
-        model_lr = get_backbone_lr(backbone)
+        model_lr = model_lr_override if model_lr_override is not None else get_backbone_lr(backbone)
         optimizer = Optimizer(filter(lambda p: p.requires_grad, metalog.model.parameters()), lr=model_lr)
         global_step = 0
         bestF = 0
@@ -504,6 +574,7 @@ if __name__ == '__main__':
             if test_BGL:
                 eval_threshold = threshold
                 selection_f = None
+                dev_f1 = float('nan')
                 if auto_threshold and dev_BGL:
                     eval_threshold, dev_metrics = metalog.tune_threshold(
                         dev_BGL,
@@ -514,13 +585,32 @@ if __name__ == '__main__':
                         split_name='dev',
                     )
                     selection_f = dev_metrics['f']
+                    dev_f1 = dev_metrics['f']
                     metalog.logger.info('Testing on test set with tuned threshold %.3f selected from dev.'
                                         % eval_threshold)
                 else:
                     metalog.logger.info('Testing on test set.')
-                _, _, test_f = metalog.evaluate(test_BGL, eval_threshold, vocab=vocab_BGL)
+                test_metrics = metalog.evaluate_metrics(test_BGL, eval_threshold, vocab=vocab_BGL)
+                metalog._log_metrics(test_metrics)
+                test_f = test_metrics['f']
+                is_best = False
                 if selection_f is None:
                     selection_f = test_f
+                if selection_f > bestF:
+                    is_best = True
+                if epoch_metrics_file:
+                    append_epoch_metrics(epoch_metrics_file, {
+                        'backbone': backbone,
+                        'epoch': epoch,
+                        'selected_threshold': '%.6f' % eval_threshold,
+                        'dev_f1': '%.6f' % dev_f1 if not np.isnan(dev_f1) else '',
+                        'precision': '%.6f' % test_metrics['precision'],
+                        'recall': '%.6f' % test_metrics['recall'],
+                        'f1': '%.6f' % test_metrics['f'],
+                        'auroc': '%.6f' % test_metrics['auroc'],
+                        'aucpr': '%.6f' % test_metrics['aucpr'],
+                        'selected_for_best': int(is_best),
+                    })
                 if selection_f > bestF:
                     metalog.logger.info("Exceed best selection f: history = %.2f, current = %.2f"
                                         % (bestF, selection_f))
