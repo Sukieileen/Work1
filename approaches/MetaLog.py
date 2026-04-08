@@ -8,8 +8,9 @@ from preprocessing.datacutter.SimpleCutting import cut_by_217, cut_by_316, cut_b
 from preprocessing.AutoLabeling import Probabilistic_Labeling
 from preprocessing.Preprocess import Preprocessor
 from module.Optimizer import Optimizer
-from module.Common import data_iter, generate_tinsts_binary_label, batch_variable_inst
+from module.Common import data_iter, generate_tinsts_binary_label
 from models.gru import AttGRUModel
+from models.mamba import AttBiMambaModel
 from utils.Vocab import Vocab
 
 
@@ -17,6 +18,21 @@ lstm_hiddens = 100
 num_layer = 2
 batch_size = 100
 epochs = 10
+mamba_state = 64
+mamba_conv = 4
+mamba_expand = 2
+mamba_variant = 'auto'
+
+
+def get_backbone_lr(backbone):
+    return 2e-4 if backbone.lower() == 'bimamba' else 2e-3
+
+
+def sanitize_probs(tag_logits):
+    tag_probs = F.softmax(tag_logits, dim=1)
+    tag_probs = torch.nan_to_num(tag_probs, nan=0.5, posinf=1.0, neginf=0.0)
+    tag_probs = torch.clamp(tag_probs, min=1e-6, max=1 - 1e-6)
+    return tag_probs
 
 
 def get_updated_network(old, new, lr, load=False):
@@ -38,17 +54,17 @@ def get_updated_network(old, new, lr, load=False):
 
 def put_theta(model, theta):
     def k_param_fn(tmp_model, name=None):
-        if len(tmp_model._modules) != 0:
-            for (k, v) in tmp_model._modules.items():
-                if name is None:
-                    k_param_fn(v, name=str(k))
-                else:
-                    k_param_fn(v, name=str(name + '.' + k))
-        else:
-            for (k, v) in tmp_model._parameters.items():
-                if not isinstance(v, torch.Tensor):
-                    continue
-                tmp_model._parameters[k] = theta[str(name + '.' + k)]
+        for (k, v) in tmp_model._parameters.items():
+            if not isinstance(v, torch.Tensor):
+                continue
+            full_name = k if name is None else str(name + '.' + k)
+            if full_name in theta:
+                tmp_model._parameters[k] = theta[full_name]
+        for (k, v) in tmp_model._modules.items():
+            if name is None:
+                k_param_fn(v, name=str(k))
+            else:
+                k_param_fn(v, name=str(name + '.' + k))
 
     k_param_fn(model)
     return model
@@ -75,36 +91,57 @@ class MetaLog:
     def logger(self):
         return MetaLog._logger
 
-    def __init__(self, vocab, num_layer, hidden_size, label2id):
+    def __init__(self, vocab, num_layer, hidden_size, label2id, backbone='gru', mamba_state=64,
+                 mamba_conv=4, mamba_expand=2, mamba_variant='auto'):
         self.label2id = label2id
         self.vocab = vocab
         self.num_layer = num_layer
         self.hidden_size = hidden_size
+        self.backbone = backbone.lower()
+        self.mamba_state = mamba_state
+        self.mamba_conv = mamba_conv
+        self.mamba_expand = mamba_expand
+        self.mamba_variant = mamba_variant
         self.batch_size = 128
         self.test_batch_size = 1024
-        self.model = AttGRUModel(vocab, self.num_layer, self.hidden_size)
-        self.bk_model = AttGRUModel(vocab, self.num_layer, self.hidden_size)
+        self.model = self._build_model()
+        self.bk_model = self._build_model()
         if torch.cuda.is_available():
             self.model = self.model.cuda(device)
             self.bk_model = self.bk_model.cuda(device)
         self.loss = nn.BCELoss()
 
+    def _build_model(self):
+        if self.backbone == 'gru':
+            return AttGRUModel(self.vocab, self.num_layer, self.hidden_size)
+        if self.backbone == 'bimamba':
+            return AttBiMambaModel(
+                self.vocab,
+                self.num_layer,
+                self.hidden_size,
+                mamba_state=self.mamba_state,
+                mamba_conv=self.mamba_conv,
+                mamba_expand=self.mamba_expand,
+                mamba_variant=self.mamba_variant,
+            )
+        raise ValueError('Unsupported backbone: %s' % self.backbone)
+
     def forward(self, inputs, targets):
         tag_logits = self.model(inputs)
-        tag_logits = F.softmax(tag_logits, dim=1)
-        loss = self.loss(tag_logits, targets)
+        tag_probs = sanitize_probs(tag_logits)
+        loss = self.loss(tag_probs, targets)
         return loss
 
     def bk_forward(self, inputs, targets):
         tag_logits = self.bk_model(inputs)
-        tag_logits = F.softmax(tag_logits, dim=1)
-        loss = self.loss(tag_logits, targets)
+        tag_probs = sanitize_probs(tag_logits)
+        loss = self.loss(tag_probs, targets)
         return loss
 
     def predict(self, inputs, threshold=None):
         with torch.no_grad():
             tag_logits = self.model(inputs)
-            tag_logits = F.softmax(tag_logits)
+            tag_logits = sanitize_probs(tag_logits)
         if threshold is not None:
             probs = tag_logits.detach().cpu().numpy()
             anomaly_id = self.label2id['Anomalous']
@@ -119,44 +156,103 @@ class MetaLog:
             pred_tags = tag_logits.detach().max(1)[1].cpu()
         return pred_tags, tag_logits
 
-    def evaluate(self, instances, threshold=0.5):
-        self.logger.info('Start evaluating by threshold %.3f' % threshold)
+    def collect_anomaly_scores(self, instances, vocab):
+        anomaly_id = self.label2id['Anomalous']
+        anomaly_scores = []
+        gold_labels = []
         with torch.no_grad():
             self.model.eval()
-            globalBatchNum = 0
-            TP, TN, FP, FN = 0, 0, 0, 0
-            tag_correct, tag_total = 0, 0
             for onebatch in data_iter(instances, self.test_batch_size, False):
-                tinst = generate_tinsts_binary_label(onebatch, vocab_BGL, False)
+                tinst = generate_tinsts_binary_label(onebatch, vocab, False)
                 tinst.to_cuda(device)
-                self.model.eval()
-                pred_tags, tag_logits = self.predict(tinst.inputs, threshold)
-                for inst, bmatch in batch_variable_inst(onebatch, pred_tags, tag_logits, processor_BGL.id2tag):
-                    tag_total += 1
-                    if bmatch:
-                        tag_correct += 1
-                        if inst.label == 'Normal':
-                            TN += 1
-                        else:
-                            TP += 1
-                    else:
-                        if inst.label == 'Normal':
-                            FP += 1
-                        else:
-                            FN += 1
-                globalBatchNum += 1
-            self.logger.info('TP: %d, TN: %d, FN: %d, FP: %d' % (TP, TN, FN, FP))
-            if TP + FP != 0:
-                precision = 100 * TP / (TP + FP)
-                recall = 100 * TP / (TP + FN)
-                f = 2 * precision * recall / (precision + recall)
-                fpr = 100 * FP /  (FP + TN)
-                self.logger.info('Precision = %d / %d = %.4f, Recall = %d / %d = %.4f F1 score = %.4f, FPR = %.4f'
-                                 % (TP, (TP + FP), precision, TP, (TP + FN), recall, f, fpr))
-            else:
-                self.logger.info('Precision is 0 and therefore f is 0')
-                precision, recall, f = 0, 0, 0
-        return precision, recall, f
+                tag_probs = sanitize_probs(self.model(tinst.inputs))
+                anomaly_scores.extend(tag_probs[:, anomaly_id].detach().cpu().numpy().tolist())
+                gold_labels.extend(self.label2id[inst.label] for inst in onebatch)
+        return np.asarray(anomaly_scores, dtype=np.float64), np.asarray(gold_labels, dtype=np.int64)
+
+    def _binary_metrics_from_scores(self, gold_labels, anomaly_scores, threshold):
+        anomaly_id = self.label2id['Anomalous']
+        gold_positive = gold_labels == anomaly_id
+        pred_positive = anomaly_scores >= threshold
+
+        TP = int(np.sum(pred_positive & gold_positive))
+        TN = int(np.sum((~pred_positive) & (~gold_positive)))
+        FP = int(np.sum(pred_positive & (~gold_positive)))
+        FN = int(np.sum((~pred_positive) & gold_positive))
+
+        precision = 100 * TP / (TP + FP) if TP + FP else 0
+        recall = 100 * TP / (TP + FN) if TP + FN else 0
+        f = 2 * precision * recall / (precision + recall) if precision + recall else 0
+        fpr = 100 * FP / (FP + TN) if FP + TN else 0
+
+        return {
+            'threshold': threshold,
+            'TP': TP,
+            'TN': TN,
+            'FP': FP,
+            'FN': FN,
+            'precision': precision,
+            'recall': recall,
+            'f': f,
+            'fpr': fpr,
+        }
+
+    def _log_metrics(self, metrics):
+        self.logger.info('TP: %d, TN: %d, FN: %d, FP: %d' %
+                         (metrics['TP'], metrics['TN'], metrics['FN'], metrics['FP']))
+        if metrics['TP'] + metrics['FP'] != 0:
+            self.logger.info(
+                'Precision = %d / %d = %.4f, Recall = %d / %d = %.4f F1 score = %.4f, FPR = %.4f'
+                % (
+                    metrics['TP'],
+                    metrics['TP'] + metrics['FP'],
+                    metrics['precision'],
+                    metrics['TP'],
+                    metrics['TP'] + metrics['FN'],
+                    metrics['recall'],
+                    metrics['f'],
+                    metrics['fpr'],
+                )
+            )
+        else:
+            self.logger.info('Precision is 0 and therefore f is 0')
+
+    def tune_threshold(self, instances, vocab, threshold_min=0.1, threshold_max=0.9, threshold_step=0.01,
+                       split_name='dev'):
+        if threshold_step <= 0:
+            raise ValueError('threshold_step must be positive.')
+        if threshold_max < threshold_min:
+            raise ValueError('threshold_max must be greater than or equal to threshold_min.')
+
+        self.logger.info('Start threshold sweep on %s set: min=%.3f max=%.3f step=%.3f'
+                         % (split_name, threshold_min, threshold_max, threshold_step))
+        anomaly_scores, gold_labels = self.collect_anomaly_scores(instances, vocab)
+        thresholds = np.arange(threshold_min, threshold_max + threshold_step * 0.5, threshold_step)
+
+        best_metrics = None
+        for threshold in thresholds:
+            metrics = self._binary_metrics_from_scores(gold_labels, anomaly_scores, float(threshold))
+            if best_metrics is None:
+                best_metrics = metrics
+                continue
+            if metrics['f'] > best_metrics['f']:
+                best_metrics = metrics
+                continue
+            if metrics['f'] == best_metrics['f'] and metrics['precision'] > best_metrics['precision']:
+                best_metrics = metrics
+
+        self.logger.info('Best threshold on %s set = %.3f' % (split_name, best_metrics['threshold']))
+        self._log_metrics(best_metrics)
+        return best_metrics['threshold'], best_metrics
+
+    def evaluate(self, instances, threshold=0.5, vocab=None):
+        if vocab is None:
+            vocab = self.vocab
+        self.logger.info('Start evaluating by threshold %.3f' % threshold)
+        anomaly_scores, gold_labels = self.collect_anomaly_scores(instances, vocab)
+        metrics = self._binary_metrics_from_scores(gold_labels, anomaly_scores, threshold)
+        self._log_metrics(metrics)
+        return metrics['precision'], metrics['recall'], metrics['f']
 
 
 if __name__ == '__main__':
@@ -174,6 +270,24 @@ if __name__ == '__main__':
                            help="Anomaly threshold.")
     argparser.add_argument('--beta', type=float, default=1.0,
                            help="weight for meta testing")
+    argparser.add_argument('--backbone', type=str, default='gru',
+                           help="Sequence encoder backbone: gru or bimamba.")
+    argparser.add_argument('--mamba_state', type=int, default=mamba_state,
+                           help="State expansion used by the BiMamba backbone.")
+    argparser.add_argument('--mamba_conv', type=int, default=mamba_conv,
+                           help="Convolution width used by the BiMamba backbone.")
+    argparser.add_argument('--mamba_expand', type=int, default=mamba_expand,
+                           help="Expansion factor used by the BiMamba backbone.")
+    argparser.add_argument('--mamba_variant', type=str, default=mamba_variant,
+                           help="Underlying Mamba block to use: auto, mamba, or mamba2.")
+    argparser.add_argument('--auto_threshold', action='store_true',
+                           help="Tune threshold on the BGL dev split before final evaluation.")
+    argparser.add_argument('--threshold_min', type=float, default=0.1,
+                           help="Lower bound for threshold sweep when auto_threshold is enabled.")
+    argparser.add_argument('--threshold_max', type=float, default=0.9,
+                           help="Upper bound for threshold sweep when auto_threshold is enabled.")
+    argparser.add_argument('--threshold_step', type=float, default=0.01,
+                           help="Step size for threshold sweep when auto_threshold is enabled.")
 
     args, extra_args = argparser.parse_known_args()
 
@@ -184,6 +298,15 @@ if __name__ == '__main__':
     reduce_dimension = args.reduce_dimension
     threshold = args.threshold
     beta = args.beta
+    backbone = args.backbone
+    mamba_state = args.mamba_state
+    mamba_conv = args.mamba_conv
+    mamba_expand = args.mamba_expand
+    mamba_variant = args.mamba_variant
+    auto_threshold = args.auto_threshold
+    threshold_min = args.threshold_min
+    threshold_max = args.threshold_max
+    threshold_step = args.threshold_step
 
     # process BGL
     dataset = 'BGL'
@@ -202,8 +325,8 @@ if __name__ == '__main__':
     # Training, Validating and Testing instances.
     template_encoder_BGL = Template_TF_IDF_without_clean() if dataset == 'NC' else Simple_template_TF_IDF()
     processor_BGL = Preprocessor()
-    train_BGL, _, test_BGL = processor_BGL.process(dataset=dataset, parsing=parser, cut_func=cut_by_316_filter,
-                                         template_encoding=template_encoder_BGL.present)
+    train_BGL, dev_BGL, test_BGL = processor_BGL.process(dataset=dataset, parsing=parser, cut_func=cut_by_316_filter,
+                                                         template_encoding=template_encoder_BGL.present)
 
     # Log sequence representation.
     sequential_encoder_BGL = Sequential_TF(processor_BGL.embedding)
@@ -307,17 +430,28 @@ if __name__ == '__main__':
     print(new_embedding.keys())
     vocab.load_from_dict(new_embedding)
 
-    metalog = MetaLog(vocab, num_layer, lstm_hiddens, processor_BGL.label2id)
+    metalog = MetaLog(
+        vocab,
+        num_layer,
+        lstm_hiddens,
+        processor_BGL.label2id,
+        backbone=backbone,
+        mamba_state=mamba_state,
+        mamba_conv=mamba_conv,
+        mamba_expand=mamba_expand,
+        mamba_variant=mamba_variant,
+    )
 
     # meta learning
-    log = 'layer={}_hidden={}_epoch={}'.format(num_layer, lstm_hiddens, epochs)
+    log = 'backbone={}_layer={}_hidden={}_epoch={}'.format(backbone, num_layer, lstm_hiddens, epochs)
     best_model_file = os.path.join(output_model_dir, log + '_best.pt')
     last_model_file = os.path.join(output_model_dir, log + '_last.pt')
     if not os.path.exists(output_model_dir):
         os.makedirs(output_model_dir)
     if mode == 'train':
         # Train
-        optimizer = Optimizer(filter(lambda p: p.requires_grad, metalog.model.parameters()), lr=2e-3)
+        model_lr = get_backbone_lr(backbone)
+        optimizer = Optimizer(filter(lambda p: p.requires_grad, metalog.model.parameters()), lr=model_lr)
         global_step = 0
         bestF = 0
         for epoch in range(epochs):
@@ -346,7 +480,7 @@ if __name__ == '__main__':
                 loss_value = loss.data.cpu().numpy()
                 loss.backward(retain_graph=True)
                 batch_iter += 1
-                metalog.bk_model = get_updated_network(metalog.model, metalog.bk_model, 2e-3).train().cuda()
+                metalog.bk_model = get_updated_network(metalog.model, metalog.bk_model, model_lr).train().cuda()
                 # meta test
                 tinst_test = generate_tinsts_binary_label(meta_test_batch, vocab_BGL)
                 tinst_test.to_cuda(device)
@@ -368,21 +502,51 @@ if __name__ == '__main__':
                     batch_iter_test = 0
                
             if test_BGL:
-                metalog.logger.info('Testing on test set.')
-                _, _, f = metalog.evaluate(test_BGL)
-                if f > bestF:
-                    metalog.logger.info("Exceed best f: history = %.2f, current = %.2f" % (bestF, f))
+                eval_threshold = threshold
+                selection_f = None
+                if auto_threshold and dev_BGL:
+                    eval_threshold, dev_metrics = metalog.tune_threshold(
+                        dev_BGL,
+                        vocab_BGL,
+                        threshold_min=threshold_min,
+                        threshold_max=threshold_max,
+                        threshold_step=threshold_step,
+                        split_name='dev',
+                    )
+                    selection_f = dev_metrics['f']
+                    metalog.logger.info('Testing on test set with tuned threshold %.3f selected from dev.'
+                                        % eval_threshold)
+                else:
+                    metalog.logger.info('Testing on test set.')
+                _, _, test_f = metalog.evaluate(test_BGL, eval_threshold, vocab=vocab_BGL)
+                if selection_f is None:
+                    selection_f = test_f
+                if selection_f > bestF:
+                    metalog.logger.info("Exceed best selection f: history = %.2f, current = %.2f"
+                                        % (bestF, selection_f))
                     torch.save(metalog.model.state_dict(), best_model_file)
-                    bestF = f
+                    bestF = selection_f
             metalog.logger.info('Training epoch %d finished.' % epoch)
             torch.save(metalog.model.state_dict(), last_model_file)
 
-    if os.path.exists(last_model_file):
-        metalog.logger.info('=== Final Model ===')
-        metalog.model.load_state_dict(torch.load(last_model_file))
-        metalog.evaluate(test_BGL, threshold)
-    if os.path.exists(best_model_file):
-        metalog.logger.info('=== Best Model ===')
-        metalog.model.load_state_dict(torch.load(best_model_file))
-        metalog.evaluate(test_BGL, threshold)
+    def evaluate_checkpoint(model_file, title):
+        if not os.path.exists(model_file):
+            return
+        metalog.logger.info('=== %s ===' % title)
+        metalog.model.load_state_dict(torch.load(model_file))
+        eval_threshold = threshold
+        if auto_threshold and dev_BGL:
+            eval_threshold, _ = metalog.tune_threshold(
+                dev_BGL,
+                vocab_BGL,
+                threshold_min=threshold_min,
+                threshold_max=threshold_max,
+                threshold_step=threshold_step,
+                split_name='dev',
+            )
+            metalog.logger.info('Use tuned threshold %.3f for %s evaluation.' % (eval_threshold, title))
+        metalog.evaluate(test_BGL, eval_threshold, vocab=vocab_BGL)
+
+    evaluate_checkpoint(last_model_file, 'Final Model')
+    evaluate_checkpoint(best_model_file, 'Best Model')
     metalog.logger.info('All Finished')

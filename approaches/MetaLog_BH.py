@@ -11,12 +11,28 @@ from preprocessing.Preprocess import Preprocessor
 from module.Optimizer import Optimizer
 from module.Common import data_iter, generate_tinsts_binary_label, batch_variable_inst
 from models.gru import AttGRUModel
+from models.mamba import AttBiMambaModel
 from utils.Vocab import Vocab
 
 lstm_hiddens = 100
 num_layer = 2
 batch_size = 100
 epochs = 10
+mamba_state = 64
+mamba_conv = 4
+mamba_expand = 2
+mamba_variant = 'auto'
+
+
+def get_backbone_lr(backbone):
+    return 2e-4 if backbone.lower() == 'bimamba' else 2e-3
+
+
+def sanitize_probs(tag_logits):
+    tag_probs = F.softmax(tag_logits, dim=1)
+    tag_probs = torch.nan_to_num(tag_probs, nan=0.5, posinf=1.0, neginf=0.0)
+    tag_probs = torch.clamp(tag_probs, min=1e-6, max=1 - 1e-6)
+    return tag_probs
 
 
 def get_updated_network(old, new, lr, load=False):
@@ -38,17 +54,17 @@ def get_updated_network(old, new, lr, load=False):
 
 def put_theta(model, theta):
     def k_param_fn(tmp_model, name=None):
-        if len(tmp_model._modules) != 0:
-            for (k, v) in tmp_model._modules.items():
-                if name is None:
-                    k_param_fn(v, name=str(k))
-                else:
-                    k_param_fn(v, name=str(name + '.' + k))
-        else:
-            for (k, v) in tmp_model._parameters.items():
-                if not isinstance(v, torch.Tensor):
-                    continue
-                tmp_model._parameters[k] = theta[str(name + '.' + k)]
+        for (k, v) in tmp_model._parameters.items():
+            if not isinstance(v, torch.Tensor):
+                continue
+            full_name = k if name is None else str(name + '.' + k)
+            if full_name in theta:
+                tmp_model._parameters[k] = theta[full_name]
+        for (k, v) in tmp_model._modules.items():
+            if name is None:
+                k_param_fn(v, name=str(k))
+            else:
+                k_param_fn(v, name=str(name + '.' + k))
 
     k_param_fn(model)
     return model
@@ -75,36 +91,57 @@ class MetaLog:
     def logger(self):
         return MetaLog._logger
 
-    def __init__(self, vocab, num_layer, hidden_size, label2id):
+    def __init__(self, vocab, num_layer, hidden_size, label2id, backbone='gru', mamba_state=64,
+                 mamba_conv=4, mamba_expand=2, mamba_variant='auto'):
         self.label2id = label2id
         self.vocab = vocab
         self.num_layer = num_layer
         self.hidden_size = hidden_size
+        self.backbone = backbone.lower()
+        self.mamba_state = mamba_state
+        self.mamba_conv = mamba_conv
+        self.mamba_expand = mamba_expand
+        self.mamba_variant = mamba_variant
         self.batch_size = 128
         self.test_batch_size = 1024
-        self.model = AttGRUModel(vocab, self.num_layer, self.hidden_size)
-        self.bk_model = AttGRUModel(vocab, self.num_layer, self.hidden_size)
+        self.model = self._build_model()
+        self.bk_model = self._build_model()
         if torch.cuda.is_available():
             self.model = self.model.cuda(device)
             self.bk_model = self.bk_model.cuda(device)
         self.loss = nn.BCELoss()
 
+    def _build_model(self):
+        if self.backbone == 'gru':
+            return AttGRUModel(self.vocab, self.num_layer, self.hidden_size)
+        if self.backbone == 'bimamba':
+            return AttBiMambaModel(
+                self.vocab,
+                self.num_layer,
+                self.hidden_size,
+                mamba_state=self.mamba_state,
+                mamba_conv=self.mamba_conv,
+                mamba_expand=self.mamba_expand,
+                mamba_variant=self.mamba_variant,
+            )
+        raise ValueError('Unsupported backbone: %s' % self.backbone)
+
     def forward(self, inputs, targets):
         tag_logits = self.model(inputs)
-        tag_logits = F.softmax(tag_logits, dim=1)
-        loss = self.loss(tag_logits, targets)
+        tag_probs = sanitize_probs(tag_logits)
+        loss = self.loss(tag_probs, targets)
         return loss
 
     def bk_forward(self, inputs, targets):
         tag_logits = self.bk_model(inputs)
-        tag_logits = F.softmax(tag_logits, dim=1)
-        loss = self.loss(tag_logits, targets)
+        tag_probs = sanitize_probs(tag_logits)
+        loss = self.loss(tag_probs, targets)
         return loss
 
     def predict(self, inputs, threshold=None):
         with torch.no_grad():
             tag_logits = self.model(inputs)
-            tag_logits = F.softmax(tag_logits)
+            tag_logits = sanitize_probs(tag_logits)
         if threshold is not None:
             probs = tag_logits.detach().cpu().numpy()
             anomaly_id = self.label2id['Anomalous']
@@ -174,6 +211,16 @@ if __name__ == '__main__':
                            help="Anomaly threshold.")
     argparser.add_argument('--beta', type=float, default=1.0,
                            help="weight for meta testing")
+    argparser.add_argument('--backbone', type=str, default='gru',
+                           help="Sequence encoder backbone: gru or bimamba.")
+    argparser.add_argument('--mamba_state', type=int, default=mamba_state,
+                           help="State expansion used by the BiMamba backbone.")
+    argparser.add_argument('--mamba_conv', type=int, default=mamba_conv,
+                           help="Convolution width used by the BiMamba backbone.")
+    argparser.add_argument('--mamba_expand', type=int, default=mamba_expand,
+                           help="Expansion factor used by the BiMamba backbone.")
+    argparser.add_argument('--mamba_variant', type=str, default=mamba_variant,
+                           help="Underlying Mamba block to use: auto, mamba, or mamba2.")
 
     args, extra_args = argparser.parse_known_args()
 
@@ -184,6 +231,11 @@ if __name__ == '__main__':
     reduce_dimension = args.reduce_dimension
     threshold = args.threshold
     beta = args.beta
+    backbone = args.backbone
+    mamba_state = args.mamba_state
+    mamba_conv = args.mamba_conv
+    mamba_expand = args.mamba_expand
+    mamba_variant = args.mamba_variant
 
     # process HDFS
     dataset = 'HDFS'
@@ -305,17 +357,28 @@ if __name__ == '__main__':
     print(new_embedding.keys())
     vocab.load_from_dict(new_embedding)
 
-    metalog = MetaLog(vocab, num_layer, lstm_hiddens, processor_HDFS.label2id)
+    metalog = MetaLog(
+        vocab,
+        num_layer,
+        lstm_hiddens,
+        processor_HDFS.label2id,
+        backbone=backbone,
+        mamba_state=mamba_state,
+        mamba_conv=mamba_conv,
+        mamba_expand=mamba_expand,
+        mamba_variant=mamba_variant,
+    )
 
     # meta learning
-    log = 'layer={}_hidden={}_epoch={}'.format(num_layer, lstm_hiddens, epochs)
+    log = 'backbone={}_layer={}_hidden={}_epoch={}'.format(backbone, num_layer, lstm_hiddens, epochs)
     best_model_file = os.path.join(output_model_dir, log + '_best.pt')
     last_model_file = os.path.join(output_model_dir, log + '_last.pt')
     if not os.path.exists(output_model_dir):
         os.makedirs(output_model_dir)
     if mode == 'train':
         # Train
-        optimizer = Optimizer(filter(lambda p: p.requires_grad, metalog.model.parameters()), lr=2e-3)
+        model_lr = get_backbone_lr(backbone)
+        optimizer = Optimizer(filter(lambda p: p.requires_grad, metalog.model.parameters()), lr=model_lr)
         global_step = 0
         bestF = 0
         for epoch in range(epochs):
@@ -344,7 +407,7 @@ if __name__ == '__main__':
                 loss_value = loss.data.cpu().numpy()
                 loss.backward(retain_graph=True)
                 batch_iter += 1
-                metalog.bk_model = get_updated_network(metalog.model, metalog.bk_model, 2e-3).train().cuda()
+                metalog.bk_model = get_updated_network(metalog.model, metalog.bk_model, model_lr).train().cuda()
                 # meta test
                 tinst_test = generate_tinsts_binary_label(meta_test_batch, vocab_BGL)
                 tinst_test.to_cuda(device)
