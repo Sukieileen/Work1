@@ -115,7 +115,9 @@ class MetaLog:
         return MetaLog._logger
 
     def __init__(self, vocab, num_layer, hidden_size, label2id, backbone='gru', dropout=0.0, mamba_state=64,
-                 mamba_conv=4, mamba_expand=2, mamba_variant='auto'):
+                 mamba_conv=4, mamba_expand=2, mamba_variant='auto', use_moe=False, moe_num_experts=4,
+                 moe_top_k=2, moe_bottleneck_dim=None, moe_temperature=1.5, moe_gate_dropout=0.1,
+                 moe_balance_loss_weight=1e-2, moe_diversity_loss_weight=1e-3, moe_z_loss_weight=0.0):
         self.label2id = label2id
         self.vocab = vocab
         self.num_layer = num_layer
@@ -126,8 +128,19 @@ class MetaLog:
         self.mamba_conv = mamba_conv
         self.mamba_expand = mamba_expand
         self.mamba_variant = mamba_variant
+        self.use_moe = use_moe
+        self.moe_num_experts = moe_num_experts
+        self.moe_top_k = moe_top_k
+        self.moe_bottleneck_dim = moe_bottleneck_dim
+        self.moe_temperature = moe_temperature
+        self.moe_gate_dropout = moe_gate_dropout
+        self.moe_balance_loss_weight = moe_balance_loss_weight
+        self.moe_diversity_loss_weight = moe_diversity_loss_weight
+        self.moe_z_loss_weight = moe_z_loss_weight
         self.batch_size = 128
         self.test_batch_size = 1024
+        self.last_train_metrics = {}
+        self.last_bk_metrics = {}
         self.model = self._build_model()
         self.bk_model = self._build_model()
         if torch.cuda.is_available():
@@ -137,7 +150,21 @@ class MetaLog:
 
     def _build_model(self):
         if self.backbone == 'gru':
-            return AttGRUModel(self.vocab, self.num_layer, self.hidden_size, dropout=self.dropout)
+            return AttGRUModel(
+                self.vocab,
+                self.num_layer,
+                self.hidden_size,
+                dropout=self.dropout,
+                use_moe=self.use_moe,
+                moe_num_experts=self.moe_num_experts,
+                moe_top_k=self.moe_top_k,
+                moe_bottleneck_dim=self.moe_bottleneck_dim,
+                moe_temperature=self.moe_temperature,
+                moe_gate_dropout=self.moe_gate_dropout,
+                moe_balance_loss_weight=self.moe_balance_loss_weight,
+                moe_diversity_loss_weight=self.moe_diversity_loss_weight,
+                moe_z_loss_weight=self.moe_z_loss_weight,
+            )
         if self.backbone == 'bimamba':
             return AttBiMambaModel(
                 self.vocab,
@@ -148,20 +175,50 @@ class MetaLog:
                 mamba_conv=self.mamba_conv,
                 mamba_expand=self.mamba_expand,
                 mamba_variant=self.mamba_variant,
+                use_moe=self.use_moe,
+                moe_num_experts=self.moe_num_experts,
+                moe_top_k=self.moe_top_k,
+                moe_bottleneck_dim=self.moe_bottleneck_dim,
+                moe_temperature=self.moe_temperature,
+                moe_gate_dropout=self.moe_gate_dropout,
+                moe_balance_loss_weight=self.moe_balance_loss_weight,
+                moe_diversity_loss_weight=self.moe_diversity_loss_weight,
+                moe_z_loss_weight=self.moe_z_loss_weight,
             )
         raise ValueError('Unsupported backbone: %s' % self.backbone)
 
     def forward(self, inputs, targets):
-        tag_logits = self.model(inputs)
-        tag_probs = sanitize_probs(tag_logits)
-        loss = self.loss(tag_probs, targets)
+        loss, self.last_train_metrics = self._compute_loss(self.model, inputs, targets)
         return loss
 
     def bk_forward(self, inputs, targets):
-        tag_logits = self.bk_model(inputs)
-        tag_probs = sanitize_probs(tag_logits)
-        loss = self.loss(tag_probs, targets)
+        loss, self.last_bk_metrics = self._compute_loss(self.bk_model, inputs, targets)
         return loss
+
+    def _compute_loss(self, model, inputs, targets):
+        tag_logits = model(inputs)
+        tag_probs = sanitize_probs(tag_logits)
+        cls_loss = self.loss(tag_probs, targets)
+        aux_loss = model.get_auxiliary_loss() if hasattr(model, 'get_auxiliary_loss') else tag_logits.new_zeros(())
+        loss = cls_loss + aux_loss
+        metrics = {
+            'cls_loss': float(cls_loss.detach().cpu().item()),
+            'aux_loss': float(aux_loss.detach().cpu().item()),
+            'total_loss': float(loss.detach().cpu().item()),
+        }
+        if hasattr(model, 'get_moe_metrics'):
+            metrics.update(self._scalarize_metrics(model.get_moe_metrics()))
+        return loss, metrics
+
+    def _scalarize_metrics(self, metrics):
+        scalar_metrics = {}
+        for key, value in metrics.items():
+            if isinstance(value, torch.Tensor):
+                if value.dim() == 0:
+                    scalar_metrics[key] = float(value.detach().cpu().item())
+            elif isinstance(value, (float, int)):
+                scalar_metrics[key] = float(value)
+        return scalar_metrics
 
     def predict(self, inputs, threshold=None):
         with torch.no_grad():
@@ -349,6 +406,24 @@ if __name__ == '__main__':
                            help="Dropout used by the sequence encoder.")
     argparser.add_argument('--run_name', type=str, default='',
                            help="Optional run name used for model checkpoint files.")
+    argparser.add_argument('--use_moe', action='store_true',
+                           help="Enable the latent MoE classifier after sequence attention.")
+    argparser.add_argument('--moe_num_experts', type=int, default=4,
+                           help="Number of latent experts used by the MoE head.")
+    argparser.add_argument('--moe_top_k', type=int, default=2,
+                           help="Top-k sparse experts selected per sequence.")
+    argparser.add_argument('--moe_bottleneck_dim', type=int, default=0,
+                           help="Expert bottleneck dimension; <= 0 falls back to sent_dim // 4.")
+    argparser.add_argument('--moe_temperature', type=float, default=1.5,
+                           help="Router softmax temperature.")
+    argparser.add_argument('--moe_gate_dropout', type=float, default=0.1,
+                           help="Dropout applied before routing.")
+    argparser.add_argument('--moe_balance_loss_weight', type=float, default=1e-2,
+                           help="Weight for the MoE load-balance auxiliary loss.")
+    argparser.add_argument('--moe_diversity_loss_weight', type=float, default=1e-3,
+                           help="Weight for the MoE diversity auxiliary loss.")
+    argparser.add_argument('--moe_z_loss_weight', type=float, default=0.0,
+                           help="Optional z-loss weight for router logits.")
 
     args, extra_args = argparser.parse_known_args()
 
@@ -373,6 +448,15 @@ if __name__ == '__main__':
     epochs = args.epochs
     dropout = args.dropout
     run_name = args.run_name
+    use_moe = args.use_moe
+    moe_num_experts = args.moe_num_experts
+    moe_top_k = args.moe_top_k
+    moe_bottleneck_dim = args.moe_bottleneck_dim if args.moe_bottleneck_dim > 0 else None
+    moe_temperature = args.moe_temperature
+    moe_gate_dropout = args.moe_gate_dropout
+    moe_balance_loss_weight = args.moe_balance_loss_weight
+    moe_diversity_loss_weight = args.moe_diversity_loss_weight
+    moe_z_loss_weight = args.moe_z_loss_weight
 
     # process BGL
     dataset = 'BGL'
@@ -507,6 +591,15 @@ if __name__ == '__main__':
         mamba_conv=mamba_conv,
         mamba_expand=mamba_expand,
         mamba_variant=mamba_variant,
+        use_moe=use_moe,
+        moe_num_experts=moe_num_experts,
+        moe_top_k=moe_top_k,
+        moe_bottleneck_dim=moe_bottleneck_dim,
+        moe_temperature=moe_temperature,
+        moe_gate_dropout=moe_gate_dropout,
+        moe_balance_loss_weight=moe_balance_loss_weight,
+        moe_diversity_loss_weight=moe_diversity_loss_weight,
+        moe_z_loss_weight=moe_z_loss_weight,
     )
 
     # meta learning
@@ -514,6 +607,8 @@ if __name__ == '__main__':
         log = run_name
     else:
         log = 'backbone={}_layer={}_hidden={}_epoch={}'.format(backbone, num_layer, lstm_hiddens, epochs)
+        if use_moe:
+            log += '_moe=e{}_k{}_tau{}'.format(moe_num_experts, min(moe_top_k, moe_num_experts), moe_temperature)
     best_model_file = os.path.join(output_model_dir, log + '_best.pt')
     last_model_file = os.path.join(output_model_dir, log + '_last.pt')
     if not os.path.exists(output_model_dir):
@@ -562,8 +657,26 @@ if __name__ == '__main__':
                 optimizer.step()
                 global_step += 1
                 if global_step % 500 == 0:
-                    metalog.logger.info("Step:%d, Epoch:%d, meta train loss:%.2f, meta test loss:%.2f" \
-                                       % (global_step, epoch, loss_value, loss_value_te))
+                    train_metrics = getattr(metalog, 'last_train_metrics', {})
+                    test_metrics = getattr(metalog, 'last_bk_metrics', {})
+                    metalog.logger.info(
+                        "Step:%d, Epoch:%d, meta train loss:%.2f (cls=%.4f aux=%.4f bal=%.4f div=%.4f), "
+                        "meta test loss:%.2f (cls=%.4f aux=%.4f bal=%.4f div=%.4f)"
+                        % (
+                            global_step,
+                            epoch,
+                            loss_value,
+                            train_metrics.get('cls_loss', 0.0),
+                            train_metrics.get('aux_loss', 0.0),
+                            train_metrics.get('moe_balance_loss', 0.0),
+                            train_metrics.get('moe_diversity_loss', 0.0),
+                            loss_value_te,
+                            test_metrics.get('cls_loss', 0.0),
+                            test_metrics.get('aux_loss', 0.0),
+                            test_metrics.get('moe_balance_loss', 0.0),
+                            test_metrics.get('moe_diversity_loss', 0.0),
+                        )
+                    )
                 if batch_iter == batch_num:
                     meta_train_loader = data_iter(labeled_train_HDFS, batch_size, True)
                     batch_iter = 0

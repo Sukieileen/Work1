@@ -1,6 +1,7 @@
 from module.Attention import *
 from module.CPUEmbedding import *
 from module.Common import *
+from models.moe import LatentMoEClassifier
 
 
 class AttGRUModel(nn.Module):
@@ -27,9 +28,12 @@ class AttGRUModel(nn.Module):
     def logger(self):
         return AttGRUModel._logger
 
-    def __init__(self, vocab, lstm_layers, lstm_hiddens, dropout=0):
+    def __init__(self, vocab, lstm_layers, lstm_hiddens, dropout=0, use_moe=False, moe_num_experts=4,
+                 moe_top_k=2, moe_bottleneck_dim=None, moe_temperature=1.5, moe_gate_dropout=0.1,
+                 moe_balance_loss_weight=1e-2, moe_diversity_loss_weight=1e-3, moe_z_loss_weight=0.0):
         super(AttGRUModel, self).__init__()
         self.dropout = dropout
+        self.use_moe = use_moe
         self.logger.info('==== Model Parameters ====')
         vocab_size, word_dims = vocab.vocab_size, vocab.word_dim
         self.word_embed = CPUEmbedding(vocab_size, word_dims, padding_idx=vocab_size - 1)
@@ -46,7 +50,32 @@ class AttGRUModel(nn.Module):
         self.atten_guide = Parameter(torch.Tensor(self.sent_dim))
         self.atten_guide.data.normal_(0, 1)
         self.atten = LinearAttention(tensor_1_dim=self.sent_dim, tensor_2_dim=self.sent_dim)
-        self.proj = NonLinear(self.sent_dim, 2)
+        if self.use_moe:
+            self.proj = LatentMoEClassifier(
+                input_dim=self.sent_dim,
+                output_dim=2,
+                num_experts=moe_num_experts,
+                top_k=moe_top_k,
+                bottleneck_dim=moe_bottleneck_dim,
+                temperature=moe_temperature,
+                gate_dropout=moe_gate_dropout,
+                balance_loss_weight=moe_balance_loss_weight,
+                diversity_loss_weight=moe_diversity_loss_weight,
+                z_loss_weight=moe_z_loss_weight,
+            )
+            self.logger.info('MoE Enabled: experts=%d, top_k=%d, bottleneck_dim=%s, temperature=%.3f, '
+                             'balance_weight=%.4g, diversity_weight=%.4g, z_weight=%.4g'
+                             % (
+                                 moe_num_experts,
+                                 min(moe_top_k, moe_num_experts),
+                                 str(moe_bottleneck_dim if moe_bottleneck_dim is not None else max(self.sent_dim // 4, 1)),
+                                 moe_temperature,
+                                 moe_balance_loss_weight,
+                                 moe_diversity_loss_weight,
+                                 moe_z_loss_weight,
+                             ))
+        else:
+            self.proj = NonLinear(self.sent_dim, 2)
 
     def reset_word_embed_weight(self, vocab, pretrained_embedding):
         vocab_size, word_dims = pretrained_embedding.shape
@@ -73,3 +102,13 @@ class AttGRUModel(nn.Module):
         # represents = represents[:, -1, :]
         outputs = self.proj(represents)
         return outputs  # , represents
+
+    def get_auxiliary_loss(self):
+        if self.use_moe:
+            return self.proj.get_auxiliary_loss()
+        return self.atten_guide.new_zeros(())
+
+    def get_moe_metrics(self):
+        if self.use_moe:
+            return self.proj.get_metrics()
+        return {}
