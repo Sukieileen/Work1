@@ -88,7 +88,7 @@ class AttGRUModel(nn.Module):
         embed = self.word_embed(words)
         if self.training:
             embed = drop_input_independent(embed, self.dropout)
-        embed = embed.cuda(device)
+        embed = embed.to(device)
         batch_size = embed.size(0)
         atten_guide = torch.unsqueeze(self.atten_guide, dim=1).expand(-1, batch_size)
         atten_guide = atten_guide.transpose(1, 0)
@@ -112,3 +112,25 @@ class AttGRUModel(nn.Module):
         if self.use_moe:
             return self.proj.get_metrics()
         return {}
+
+    def backbone_parameters(self):
+        params = list(self.word_embed.parameters())
+        params.extend(self.rnn.parameters())
+        params.append(self.atten_guide)
+        params.extend(self.atten.parameters())
+        return params
+
+    def gate_parameters(self):
+        if not self.use_moe:
+            return list(self.proj.parameters())
+        params = list(self.proj.input_norm.parameters())
+        params.extend(self.proj.router.parameters())
+        return params
+
+    def expert_parameters(self):
+        if not self.use_moe:
+            return []
+        params = list(self.proj.down_projs.parameters())
+        params.extend(self.proj.up_projs.parameters())
+        params.extend(self.proj.heads.parameters())
+        return params

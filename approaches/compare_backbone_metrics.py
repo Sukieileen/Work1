@@ -19,50 +19,16 @@ from approaches.MetaLog import (
     mamba_variant,
     num_layer,
 )
-from preprocessing.Preprocess import Preprocessor
-from preprocessing.datacutter.SimpleCutting import cut_by_316_filter, cut_by_415
-from representations.templates.statistics import Simple_template_TF_IDF, Template_TF_IDF_without_clean
-from utils.Vocab import Vocab
+from approaches.supervised_protocol import load_checkpoint_state_dict, prepare_protocol_context
 
 
 def build_eval_context(parser_name):
-    dataset = 'BGL'
-    template_encoder_BGL = Template_TF_IDF_without_clean() if dataset == 'NC' else Simple_template_TF_IDF()
-    processor_BGL = Preprocessor()
-    _, dev_BGL, test_BGL = processor_BGL.process(
-        dataset=dataset,
-        parsing=parser_name,
-        cut_func=cut_by_316_filter,
-        template_encoding=template_encoder_BGL.present,
-    )
-    vocab_BGL = Vocab()
-    vocab_BGL.load_from_dict(processor_BGL.embedding)
-
-    dataset = 'HDFS'
-    template_encoder_HDFS = Template_TF_IDF_without_clean() if dataset == 'NC' else Simple_template_TF_IDF()
-    processor_HDFS = Preprocessor()
-    processor_HDFS.process(
-        dataset=dataset,
-        parsing=parser_name,
-        cut_func=cut_by_415,
-        template_encoding=template_encoder_HDFS.present,
-    )
-
-    merged_embedding = {}
-    for key, value in processor_BGL.embedding.items():
-        merged_embedding[key] = value
-    for key, value in processor_HDFS.embedding.items():
-        merged_embedding[key + 432] = value
-
-    vocab = Vocab()
-    vocab.load_from_dict(merged_embedding)
-
+    context = prepare_protocol_context('hdfs_to_bgl', parser_name)
     return {
-        'dev_BGL': dev_BGL,
-        'test_BGL': test_BGL,
-        'vocab': vocab,
-        'vocab_BGL': vocab_BGL,
-        'label2id': processor_BGL.label2id,
+        'selection_split': context['target_train'],
+        'test_split': context['target_test'],
+        'vocab': context['vocab'],
+        'label2id': context['label2id'],
     }
 
 
@@ -90,18 +56,18 @@ def evaluate_backbone(context, backbone_name, checkpoint_path, threshold_min, th
     else:
         raise ValueError('Unsupported backbone: %s' % backbone_name)
 
-    metalog.model.load_state_dict(torch.load(checkpoint_path))
+    metalog.model.load_state_dict(load_checkpoint_state_dict(checkpoint_path))
 
-    tuned_threshold, dev_metrics = metalog.tune_threshold(
-        context['dev_BGL'],
-        context['vocab_BGL'],
+    tuned_threshold, selection_metrics = metalog.tune_threshold(
+        context['selection_split'],
+        context['vocab'],
         threshold_min=threshold_min,
         threshold_max=threshold_max,
         threshold_step=threshold_step,
-        split_name='dev',
+        split_name='target-train',
     )
 
-    anomaly_scores, gold_labels = metalog.collect_anomaly_scores(context['test_BGL'], context['vocab_BGL'])
+    anomaly_scores, gold_labels = metalog.collect_anomaly_scores(context['test_split'], context['vocab'])
     test_metrics = metalog._binary_metrics_from_scores(gold_labels, anomaly_scores, tuned_threshold)
     auroc = roc_auc_score(gold_labels, anomaly_scores)
     aucpr = average_precision_score(gold_labels, anomaly_scores)
@@ -110,7 +76,7 @@ def evaluate_backbone(context, backbone_name, checkpoint_path, threshold_min, th
         'backbone': backbone_name,
         'checkpoint': checkpoint_path,
         'selected_threshold': tuned_threshold,
-        'dev_f1': dev_metrics['f'],
+        'selection_f1': selection_metrics['f'],
         'test_precision': test_metrics['precision'],
         'test_recall': test_metrics['recall'],
         'test_f1': test_metrics['f'],
@@ -134,7 +100,7 @@ def write_results(output_file, results):
         'backbone',
         'checkpoint',
         'selected_threshold',
-        'dev_f1',
+        'selection_f1',
         'test_precision',
         'test_recall',
         'test_f1',
