@@ -36,9 +36,11 @@ class DirectionConfig:
     name: str
     source_dataset: str
     target_dataset: str
-    source_ratio: float
-    target_normal_ratio: float
-    target_anomaly_ratio: float
+    source_train_ratio: float
+    source_dev_ratio: float
+    target_train_ratio: float
+    target_dev_ratio: float
+    target_train_anomaly_keep_ratio: float
 
 
 DIRECTION_CONFIGS = {
@@ -46,17 +48,21 @@ DIRECTION_CONFIGS = {
         name='hdfs_to_bgl',
         source_dataset='HDFS',
         target_dataset='BGL',
-        source_ratio=0.3,
-        target_normal_ratio=0.3,
-        target_anomaly_ratio=0.01,
+        source_train_ratio=0.4,
+        source_dev_ratio=0.1,
+        target_train_ratio=0.3,
+        target_dev_ratio=0.1,
+        target_train_anomaly_keep_ratio=0.01,
     ),
     'bgl_to_hdfs': DirectionConfig(
         name='bgl_to_hdfs',
         source_dataset='BGL',
         target_dataset='HDFS',
-        source_ratio=1.0,
-        target_normal_ratio=0.1,
-        target_anomaly_ratio=0.01,
+        source_train_ratio=1.0,
+        source_dev_ratio=0.0,
+        target_train_ratio=0.2,
+        target_dev_ratio=0.5,
+        target_train_anomaly_keep_ratio=0.01,
     ),
 }
 
@@ -135,76 +141,42 @@ def remap_instances(instances, mapping, fallback_event_id=None):
     ]
 
 
-def split_instances_by_ratio(instances, ratio, rng):
-    shuffled = list(instances)
-    rng.shuffle(shuffled)
-    train_size = int(len(shuffled) * ratio)
-    return shuffled[:train_size], shuffled[train_size:]
+def split_instances_by_ordered_prefix(instances, train_ratio, dev_ratio, rng):
+    if train_ratio < 0 or dev_ratio < 0 or train_ratio + dev_ratio > 1:
+        raise ValueError('train_ratio and dev_ratio must be non-negative and sum to at most 1.')
+    if train_ratio == 1.0 and dev_ratio == 0.0:
+        return list(instances), [], []
+
+    train_size = int(len(instances) * train_ratio)
+    dev_size = int(len(instances) * dev_ratio)
+    prefix_instances = list(instances[:train_size + dev_size])
+    rng.shuffle(prefix_instances)
+    train_instances = prefix_instances[:train_size]
+    dev_instances = prefix_instances[train_size:]
+    test_instances = list(instances[train_size + dev_size:])
+    return train_instances, dev_instances, test_instances
 
 
-def split_instances_by_label_ratios(instances, normal_ratio, anomaly_ratio, rng):
-    normal_instances = [inst for inst in instances if inst.label == 'Normal']
-    anomaly_instances = [inst for inst in instances if inst.label == 'Anomalous']
-    rng.shuffle(normal_instances)
-    rng.shuffle(anomaly_instances)
+def keep_target_train_anomalies_by_ratio(instances, keep_ratio, rng):
+    if keep_ratio >= 1:
+        return list(instances)
+    if keep_ratio < 0:
+        raise ValueError('keep_ratio must be non-negative.')
 
-    normal_train_size = int(len(normal_instances) * normal_ratio)
-    anomaly_train_size = int(len(anomaly_instances) * anomaly_ratio)
+    anomaly_positions = [idx for idx, inst in enumerate(instances) if inst.label == 'Anomalous']
+    keep_count = int(len(anomaly_positions) * keep_ratio)
+    if keep_count >= len(anomaly_positions):
+        return list(instances)
 
-    train_instances = normal_instances[:normal_train_size] + anomaly_instances[:anomaly_train_size]
-    test_instances = normal_instances[normal_train_size:] + anomaly_instances[anomaly_train_size:]
-    rng.shuffle(train_instances)
-    rng.shuffle(test_instances)
-    return train_instances, test_instances
+    kept_positions = set()
+    if keep_count > 0:
+        rng.shuffle(anomaly_positions)
+        kept_positions.update(anomaly_positions[:keep_count])
 
-
-def split_instances_by_sequence_groups(instances, ratio, rng):
-    grouped_instances = {}
-    for inst in instances:
-        sequence_key = tuple(inst.sequence)
-        if sequence_key not in grouped_instances:
-            grouped_instances[sequence_key] = []
-        grouped_instances[sequence_key].append(inst)
-
-    grouped_instances = list(grouped_instances.values())
-    rng.shuffle(grouped_instances)
-    target_train_size = int(len(instances) * ratio)
-
-    train_instances = []
-    test_instances = []
-    current_train_size = 0
-    for group in grouped_instances:
-        group_size = len(group)
-        if current_train_size >= target_train_size:
-            test_instances.extend(group)
-            continue
-
-        deficit = target_train_size - current_train_size
-        overshoot = current_train_size + group_size - target_train_size
-        should_add_to_train = group_size <= deficit or deficit >= overshoot
-        if should_add_to_train:
-            train_instances.extend(group)
-            current_train_size += group_size
-        else:
-            test_instances.extend(group)
-
-    rng.shuffle(train_instances)
-    rng.shuffle(test_instances)
-    return train_instances, test_instances
-
-
-def split_instances_by_grouped_label_ratios(instances, normal_ratio, anomaly_ratio, rng):
-    normal_instances = [inst for inst in instances if inst.label == 'Normal']
-    anomaly_instances = [inst for inst in instances if inst.label == 'Anomalous']
-
-    normal_train, normal_test = split_instances_by_sequence_groups(normal_instances, normal_ratio, rng)
-    anomaly_train, anomaly_test = split_instances_by_sequence_groups(anomaly_instances, anomaly_ratio, rng)
-
-    train_instances = normal_train + anomaly_train
-    test_instances = normal_test + anomaly_test
-    rng.shuffle(train_instances)
-    rng.shuffle(test_instances)
-    return train_instances, test_instances
+    return [
+        inst for idx, inst in enumerate(instances)
+        if inst.label != 'Anomalous' or idx in kept_positions
+    ]
 
 
 def collect_event_ids(instances):
@@ -585,11 +557,21 @@ def prepare_protocol_context(direction_key, parser_name):
     target_processor, target_instances = prepare_dataset(direction.target_dataset, parser_name, template_encoder)
 
     rng = np.random.RandomState(seed)
-    source_train_raw, _ = split_instances_by_ratio(source_instances, direction.source_ratio, rng)
-    target_train_raw, target_test_raw = split_instances_by_grouped_label_ratios(
+    source_train_raw, source_dev_raw, _ = split_instances_by_ordered_prefix(
+        source_instances,
+        direction.source_train_ratio,
+        direction.source_dev_ratio,
+        rng,
+    )
+    target_train_raw, target_dev_raw, target_test_raw = split_instances_by_ordered_prefix(
         target_instances,
-        direction.target_normal_ratio,
-        direction.target_anomaly_ratio,
+        direction.target_train_ratio,
+        direction.target_dev_ratio,
+        rng,
+    )
+    target_train_raw = keep_target_train_anomalies_by_ratio(
+        target_train_raw,
+        direction.target_train_anomaly_keep_ratio,
         rng,
     )
 
@@ -608,13 +590,21 @@ def prepare_protocol_context(direction_key, parser_name):
 
     target_oov_token = '__%s_target_oov__' % direction.target_dataset.lower()
     source_train = remap_instances(source_train_raw, domain_mappings[direction.source_dataset])
+    source_dev = remap_instances(source_dev_raw, domain_mappings[direction.source_dataset])
     target_train = remap_instances(target_train_raw, domain_mappings[direction.target_dataset])
+    target_dev = remap_instances(
+        target_dev_raw,
+        domain_mappings[direction.target_dataset],
+        fallback_event_id=target_oov_token,
+    )
     target_test = remap_instances(
         target_test_raw,
         domain_mappings[direction.target_dataset],
         fallback_event_id=target_oov_token,
     )
     exact_overlap = count_exact_sequence_overlap(target_train, target_test)
+    exact_dev_overlap = count_exact_sequence_overlap(target_train, target_dev)
+    target_dev_oov_events = count_oov_events(target_dev, target_oov_token)
     target_test_oov_events = count_oov_events(target_test, target_oov_token)
 
     vocab = Vocab()
@@ -625,9 +615,17 @@ def prepare_protocol_context(direction_key, parser_name):
         'vocab': vocab,
         'label2id': target_processor.label2id,
         'source_train': source_train,
+        'source_dev': source_dev,
         'target_train': target_train,
+        'target_dev': target_dev,
         'target_test': target_test,
+        # Keep threshold tuning on target_train so we do not consume extra target labels
+        # beyond what the original MetaLog training loop exposed.
+        'selection_split': target_train,
+        'selection_split_name': 'target-train',
+        'exact_target_dev_overlap': exact_dev_overlap,
         'exact_target_overlap': exact_overlap,
+        'target_dev_oov_events': target_dev_oov_events,
         'target_test_oov_events': target_test_oov_events,
     }
 
@@ -696,18 +694,20 @@ def log_epoch_summary(logger, phase_name, epoch, metrics):
 
 
 def evaluate_target(metalog, context, args, split_name):
+    selection_split = context['selection_split']
+    selection_split_name = context['selection_split_name']
     if args.auto_threshold:
         threshold, selection_metrics = metalog.tune_threshold(
-            context['target_train'],
+            selection_split,
             context['vocab'],
             threshold_min=args.threshold_min,
             threshold_max=args.threshold_max,
             threshold_step=args.threshold_step,
-            split_name='%s-target-train' % split_name,
+            split_name='%s-%s' % (split_name, selection_split_name),
         )
     else:
         threshold = args.threshold
-        selection_metrics = metalog.evaluate_metrics(context['target_train'], threshold=threshold, vocab=context['vocab'])
+        selection_metrics = metalog.evaluate_metrics(selection_split, threshold=threshold, vocab=context['vocab'])
     test_metrics = metalog.evaluate_metrics(context['target_test'], threshold=threshold, vocab=context['vocab'])
     return threshold, selection_metrics, test_metrics
 
@@ -1071,22 +1071,31 @@ def run_direction(direction_key, args):
 
     logger = MetaLog._logger
     logger.info(
-        'Prepared %s | source %s train=%d (%s) | target %s train=%d (%s) | target test=%d (%s)'
+        'Prepared %s | source %s train=%d (%s) dev=%d (%s) | target %s train=%d (%s) dev=%d (%s) test=%d (%s)'
         % (
             direction_key,
             context['direction'].source_dataset,
             len(context['source_train']),
             label_summary(context['source_train']),
+            len(context['source_dev']),
+            label_summary(context['source_dev']),
             context['direction'].target_dataset,
             len(context['target_train']),
             label_summary(context['target_train']),
+            len(context['target_dev']),
+            label_summary(context['target_dev']),
             len(context['target_test']),
             label_summary(context['target_test']),
         )
     )
     logger.info(
-        'Leakage guard stats | exact target sequence overlap=%d | target test OOV events=%d'
-        % (context['exact_target_overlap'], context['target_test_oov_events'])
+        'Leakage guard stats | target dev overlap=%d dev OOV=%d | target test overlap=%d test OOV=%d'
+        % (
+            context['exact_target_dev_overlap'],
+            context['target_dev_oov_events'],
+            context['exact_target_overlap'],
+            context['target_test_oov_events'],
+        )
     )
 
     if args.mode == 'test':
@@ -1118,12 +1127,12 @@ def run_direction(direction_key, args):
             )
             evaluator.load_model_state(checkpoint_path)
             threshold, _ = evaluator.tune_threshold(
-                context['target_train'],
+                context['selection_split'],
                 context['vocab'],
                 threshold_min=args.threshold_min,
                 threshold_max=args.threshold_max,
                 threshold_step=args.threshold_step,
-                split_name='target-train',
+                split_name=context['selection_split_name'],
             )
         final_evaluate(context, args, checkpoint_path, threshold)
         return

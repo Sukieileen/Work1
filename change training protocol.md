@@ -18,36 +18,43 @@
 
 ## 2. 与 MetaLog 原文保持一致的数据设定
 
+这里以 `MetaLog` 仓库代码实现为准，而不是按口头近似描述理解。原版的关键不是“把 normal/anomaly 两类样本分别独立按比例切出来”，而是：
+
+1. 先按原始实例顺序切出一个 `train+dev` 前缀；
+2. 只在这个前缀内部打乱，得到 `train/dev`；
+3. 对 target 域，只在 `train` 里再做一次异常保留；
+4. `dev` 保留出来，但原始训练脚本基本没有真正消费它。
+
 ### 2.1 HDFS -> BGL
 
-训练集：
+按原版 `cut_by_415` 与 `cut_by_316_filter`：
 
-- Source: `30% HDFS sessions`
-- Target: `30% BGL normal sessions + 1% BGL anomaly sessions`
+- Source(HDFS): `40% train / 10% dev / 50% unused`
+- Target(BGL): `30% train / 10% dev / 60% test`
+- Target 异常暴露规则：只在 target `train` 内保留 `1%` 异常，因此对整份 BGL 来说，模型实际看到的是“大约 `30%` normal + `0.3%` anomaly”，不是“整库 `1%` anomaly”
 
-测试集：
-
-- `remaining BGL sessions`
+当前协议如果想和原版公平比较，target 只能暴露到这个量级。
 
 ### 2.2 BGL -> HDFS
 
-训练集：
+按原版 `cut_all` 与 `cut_by_253_filter`：
 
 - Source: `all BGL sessions`
-- Target: `10% HDFS normal sessions + 1% HDFS anomaly sessions`
+- Target(HDFS): `20% train / 50% dev / 30% test`
+- Target 异常暴露规则：只在 target `train` 内保留 `1%` 异常，因此对整份 HDFS 来说，模型实际看到的是“大约 `20%` normal + `0.2%` anomaly”
 
-测试集：
-
-- `remaining HDFS sessions`
+这也是之前协议里最不公平的地方之一：如果直接按“`10% normal + 1% anomaly` 整库独立采样”，会同时少看 normal、又多看 anomaly。
 
 ### 2.3 原则
 
 后续所有训练协议都必须满足：
 
 - **不额外增加 target 训练数据量**；
+- **不把 target 的 anomaly 暴露量从“train 内 1% 保留”偷换成“整库 1% 抽样”**；
 - **不把 target 全量无标注数据并入训练**；
 - **不做人为的 source/target 样本数强行平衡**；
-- **仅在训练策略上改造，不在数据使用量上破坏与 MetaLog 的可比性**。
+- **仅在训练策略上改造，不在数据使用量上破坏与 MetaLog 的可比性**；
+- **如果要利用保留下来的 dev split，也要单独论证，因为那会让模型额外获得 target 域监督信息**。
 
 ---
 
@@ -136,7 +143,7 @@ Embedding -> BiMamba -> LinearAttention -> single head
 ### 6.3 训练数据
 
 - 只用 source 训练集；
-- HDFS->BGL 时只用 `30% HDFS`；
+- HDFS->BGL 时只用 `40% HDFS`；
 - BGL->HDFS 时只用 `all BGL`。
 
 ### 6.4 损失
@@ -308,8 +315,8 @@ L_total = L_src + λ_tgt * L_tgt + λ_bal * L_balance + λ_div * L_div
 
 只使用与原文相同的那一小撮 target 训练数据：
 
-- HDFS->BGL: `30% BGL normal + 1% BGL anomaly`
-- BGL->HDFS: `10% HDFS normal + 1% HDFS anomaly`
+- HDFS->BGL: `30% BGL train slice + train 内 1% anomaly 保留`
+- BGL->HDFS: `20% HDFS train slice + train 内 1% anomaly 保留`
 
 ### 8.3 更新参数
 
@@ -452,10 +459,10 @@ L_total = L_src + λ_tgt * L_tgt + λ_bal * L_balance + λ_div * L_div
 
 ### HDFS -> BGL
 
-1. 用 `30% HDFS` 做 source-only warmup
+1. 用 `40% HDFS` 做 source-only warmup
 2. 用：
-   - source = `30% HDFS`
-   - target = `30% BGL normal + 1% BGL anomaly`
+   - source = `40% HDFS`
+   - target = `30% BGL train slice + train 内 1% anomaly 保留`
    做 joint fine-tune
 3. 每步：
    - 一个 source batch
@@ -473,7 +480,7 @@ L = L_src + 4 * L_tgt + λ_bal * L_balance + λ_div * L_div
 1. 用 `all BGL` 做 source-only warmup
 2. 用：
    - source = `all BGL`
-   - target = `10% HDFS normal + 1% HDFS anomaly`
+   - target = `20% HDFS train slice + train 内 1% anomaly 保留`
    做 joint fine-tune
 3. 每步：
    - 一个 source batch
@@ -516,4 +523,3 @@ L = L_src + 4 * L_tgt + λ_bal * L_balance + λ_div * L_div
 而是：
 
 ## **严格沿用 MetaLog 的 target 数据量设定，采用 source-only warmup + source/target joint fine-tune + target calibration 的普通监督训练协议。**
-

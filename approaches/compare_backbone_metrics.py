@@ -25,7 +25,8 @@ from approaches.supervised_protocol import load_checkpoint_state_dict, prepare_p
 def build_eval_context(parser_name):
     context = prepare_protocol_context('hdfs_to_bgl', parser_name)
     return {
-        'selection_split': context['target_train'],
+        'selection_split': context['selection_split'],
+        'selection_split_name': context['selection_split_name'],
         'test_split': context['target_test'],
         'vocab': context['vocab'],
         'label2id': context['label2id'],
@@ -64,7 +65,7 @@ def evaluate_backbone(context, backbone_name, checkpoint_path, threshold_min, th
         threshold_min=threshold_min,
         threshold_max=threshold_max,
         threshold_step=threshold_step,
-        split_name='target-train',
+        split_name=context['selection_split_name'],
     )
 
     anomaly_scores, gold_labels = metalog.collect_anomaly_scores(context['test_split'], context['vocab'])
