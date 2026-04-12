@@ -77,6 +77,7 @@ def append_epoch_metrics(csv_file, row):
         'direction',
         'phase',
         'epoch',
+        'phase_mean_loss',
         'selected_threshold',
         'selection_f1',
         'test_precision',
@@ -127,9 +128,9 @@ def build_merged_embeddings(domain_embeddings):
     return merged_embeddings, domain_mappings
 
 
-def remap_instances(instances, mapping):
+def remap_instances(instances, mapping, fallback_event_id=None):
     return [
-        clone_instance_with_sequence(inst, [mapping[event_id] for event_id in inst.sequence])
+        clone_instance_with_sequence(inst, [mapping.get(event_id, fallback_event_id) for event_id in inst.sequence])
         for inst in instances
     ]
 
@@ -155,6 +156,79 @@ def split_instances_by_label_ratios(instances, normal_ratio, anomaly_ratio, rng)
     rng.shuffle(train_instances)
     rng.shuffle(test_instances)
     return train_instances, test_instances
+
+
+def split_instances_by_sequence_groups(instances, ratio, rng):
+    grouped_instances = {}
+    for inst in instances:
+        sequence_key = tuple(inst.sequence)
+        if sequence_key not in grouped_instances:
+            grouped_instances[sequence_key] = []
+        grouped_instances[sequence_key].append(inst)
+
+    grouped_instances = list(grouped_instances.values())
+    rng.shuffle(grouped_instances)
+    target_train_size = int(len(instances) * ratio)
+
+    train_instances = []
+    test_instances = []
+    current_train_size = 0
+    for group in grouped_instances:
+        group_size = len(group)
+        if current_train_size >= target_train_size:
+            test_instances.extend(group)
+            continue
+
+        deficit = target_train_size - current_train_size
+        overshoot = current_train_size + group_size - target_train_size
+        should_add_to_train = group_size <= deficit or deficit >= overshoot
+        if should_add_to_train:
+            train_instances.extend(group)
+            current_train_size += group_size
+        else:
+            test_instances.extend(group)
+
+    rng.shuffle(train_instances)
+    rng.shuffle(test_instances)
+    return train_instances, test_instances
+
+
+def split_instances_by_grouped_label_ratios(instances, normal_ratio, anomaly_ratio, rng):
+    normal_instances = [inst for inst in instances if inst.label == 'Normal']
+    anomaly_instances = [inst for inst in instances if inst.label == 'Anomalous']
+
+    normal_train, normal_test = split_instances_by_sequence_groups(normal_instances, normal_ratio, rng)
+    anomaly_train, anomaly_test = split_instances_by_sequence_groups(anomaly_instances, anomaly_ratio, rng)
+
+    train_instances = normal_train + anomaly_train
+    test_instances = normal_test + anomaly_test
+    rng.shuffle(train_instances)
+    rng.shuffle(test_instances)
+    return train_instances, test_instances
+
+
+def collect_event_ids(instances):
+    event_ids = set()
+    for inst in instances:
+        event_ids.update(inst.sequence)
+    return event_ids
+
+
+def filter_embeddings_by_event_ids(id2embed, event_ids):
+    return {
+        event_id: id2embed[event_id]
+        for event_id in sorted(event_ids)
+        if event_id in id2embed
+    }
+
+
+def count_exact_sequence_overlap(train_instances, test_instances):
+    train_sequences = set(tuple(inst.sequence) for inst in train_instances)
+    return sum(1 for inst in test_instances if tuple(inst.sequence) in train_sequences)
+
+
+def count_oov_events(instances, oov_event_id):
+    return sum(1 for inst in instances for event_id in inst.sequence if event_id == oov_event_id)
 
 
 def label_summary(instances):
@@ -510,22 +584,38 @@ def prepare_protocol_context(direction_key, parser_name):
     source_processor, source_instances = prepare_dataset(direction.source_dataset, parser_name, template_encoder)
     target_processor, target_instances = prepare_dataset(direction.target_dataset, parser_name, template_encoder)
 
-    merged_embeddings, domain_mappings = build_merged_embeddings({
-        direction.source_dataset: source_processor.embedding,
-        direction.target_dataset: target_processor.embedding,
-    })
-
-    remapped_source_instances = remap_instances(source_instances, domain_mappings[direction.source_dataset])
-    remapped_target_instances = remap_instances(target_instances, domain_mappings[direction.target_dataset])
-
     rng = np.random.RandomState(seed)
-    source_train, _ = split_instances_by_ratio(remapped_source_instances, direction.source_ratio, rng)
-    target_train, target_test = split_instances_by_label_ratios(
-        remapped_target_instances,
+    source_train_raw, _ = split_instances_by_ratio(source_instances, direction.source_ratio, rng)
+    target_train_raw, target_test_raw = split_instances_by_grouped_label_ratios(
+        target_instances,
         direction.target_normal_ratio,
         direction.target_anomaly_ratio,
         rng,
     )
+
+    source_embeddings = filter_embeddings_by_event_ids(
+        source_processor.embedding,
+        collect_event_ids(source_train_raw),
+    )
+    target_embeddings = filter_embeddings_by_event_ids(
+        target_processor.embedding,
+        collect_event_ids(target_train_raw),
+    )
+    merged_embeddings, domain_mappings = build_merged_embeddings({
+        direction.source_dataset: source_embeddings,
+        direction.target_dataset: target_embeddings,
+    })
+
+    target_oov_token = '__%s_target_oov__' % direction.target_dataset.lower()
+    source_train = remap_instances(source_train_raw, domain_mappings[direction.source_dataset])
+    target_train = remap_instances(target_train_raw, domain_mappings[direction.target_dataset])
+    target_test = remap_instances(
+        target_test_raw,
+        domain_mappings[direction.target_dataset],
+        fallback_event_id=target_oov_token,
+    )
+    exact_overlap = count_exact_sequence_overlap(target_train, target_test)
+    target_test_oov_events = count_oov_events(target_test, target_oov_token)
 
     vocab = Vocab()
     vocab.load_from_dict(merged_embeddings)
@@ -537,6 +627,8 @@ def prepare_protocol_context(direction_key, parser_name):
         'source_train': source_train,
         'target_train': target_train,
         'target_test': target_test,
+        'exact_target_overlap': exact_overlap,
+        'target_test_oov_events': target_test_oov_events,
     }
 
 
@@ -621,13 +713,14 @@ def evaluate_target(metalog, context, args, split_name):
 
 
 def maybe_record_epoch_metrics(args, direction_name, phase_name, epoch, threshold, selection_metrics, test_metrics,
-                               selected_for_best):
+                               selected_for_best, phase_mean_loss=None):
     if not args.epoch_metrics_file:
         return
     append_epoch_metrics(args.epoch_metrics_file, {
         'direction': direction_name,
         'phase': phase_name,
         'epoch': epoch,
+        'phase_mean_loss': '%.6f' % phase_mean_loss if phase_mean_loss is not None else '',
         'selected_threshold': '%.6f' % threshold,
         'selection_f1': '%.6f' % selection_metrics['f'],
         'test_precision': '%.6f' % test_metrics['precision'],
@@ -670,9 +763,27 @@ def run_warmup(context, args, checkpoint_prefix):
             epoch_losses.append(metrics['total_loss'])
 
         mean_loss = float(np.mean(epoch_losses)) if epoch_losses else 0.0
-        log_epoch_summary(metalog.logger, 'PhaseA', epoch, {'mean_loss': mean_loss})
+        threshold, selection_metrics, test_metrics = evaluate_target(metalog, context, args, 'PhaseA')
+        log_epoch_summary(metalog.logger, 'PhaseA', epoch, {
+            'mean_loss': mean_loss,
+            'selection_f1': selection_metrics['f'],
+            'test_f1': test_metrics['f'],
+            'threshold': threshold,
+        })
         save_model_state(metalog.model, last_checkpoint)
-        if best_loss is None or mean_loss < best_loss:
+        is_best = best_loss is None or mean_loss < best_loss
+        maybe_record_epoch_metrics(
+            args,
+            context['direction'].name,
+            'phase_a',
+            epoch,
+            threshold,
+            selection_metrics,
+            test_metrics,
+            is_best,
+            phase_mean_loss=mean_loss,
+        )
+        if is_best:
             best_loss = mean_loss
             save_model_state(metalog.model, best_checkpoint)
 
@@ -754,7 +865,7 @@ def run_joint_finetune(context, args, checkpoint_prefix, warmup_checkpoint):
             save_model_state(metalog.model, best_checkpoint)
             save_threshold(best_threshold_file, threshold)
 
-    return best_checkpoint, best_threshold
+    return best_checkpoint, best_threshold, last_checkpoint
 
 
 def run_calibration(context, args, checkpoint_prefix, joint_checkpoint):
@@ -973,6 +1084,10 @@ def run_direction(direction_key, args):
             label_summary(context['target_test']),
         )
     )
+    logger.info(
+        'Leakage guard stats | exact target sequence overlap=%d | target test OOV events=%d'
+        % (context['exact_target_overlap'], context['target_test_oov_events'])
+    )
 
     if args.mode == 'test':
         checkpoint_path = args.checkpoint
@@ -1014,6 +1129,11 @@ def run_direction(direction_key, args):
         return
 
     warmup_checkpoint = run_warmup(context, args, checkpoint_prefix)
-    joint_checkpoint, _ = run_joint_finetune(context, args, checkpoint_prefix, warmup_checkpoint)
-    calibration_checkpoint, calibration_threshold = run_calibration(context, args, checkpoint_prefix, joint_checkpoint)
+    _, _, joint_last_checkpoint = run_joint_finetune(context, args, checkpoint_prefix, warmup_checkpoint)
+    calibration_checkpoint, calibration_threshold = run_calibration(
+        context,
+        args,
+        checkpoint_prefix,
+        joint_last_checkpoint,
+    )
     final_evaluate(context, args, calibration_checkpoint, calibration_threshold)
