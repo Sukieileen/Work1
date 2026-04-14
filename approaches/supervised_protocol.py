@@ -14,6 +14,7 @@ from models.gru import AttGRUModel
 from models.mamba import AttBiMambaModel
 from preprocessing.AutoLabeling import Probabilistic_Labeling
 from preprocessing.Preprocess import Preprocessor
+from representations.parser_free import ParserFreeEncoder
 from representations.sequences.statistics import Sequential_TF
 from representations.templates.statistics import Simple_template_TF_IDF, Template_TF_IDF_without_clean
 from utils.Vocab import Vocab
@@ -93,6 +94,14 @@ PSEUDO_LABEL_DEFAULTS = {
     'normal_fraction': 0.5,
 }
 
+PARSER_FREE_DEFAULTS = {
+    'model_name': 'bert-base-uncased',
+    'max_length': 64,
+    'batch_size': 64,
+    'pooling': 'mean',
+    'cache_dir': '',
+}
+
 
 def sanitize_probs(tag_logits):
     tag_probs = F.softmax(tag_logits, dim=1)
@@ -167,11 +176,16 @@ def build_merged_embeddings(domain_embeddings):
     return merged_embeddings, domain_mappings
 
 
-def remap_instances(instances, mapping, fallback_event_id=None):
-    return [
-        clone_instance_with_sequence(inst, [mapping.get(event_id, fallback_event_id) for event_id in inst.sequence])
-        for inst in instances
-    ]
+def remap_instances(instances, mapping):
+    remapped_instances = []
+    for inst in instances:
+        remapped_sequence = []
+        for event_id in inst.sequence:
+            if event_id not in mapping:
+                raise KeyError('Missing event_id %s in merged embedding mapping.' % str(event_id))
+            remapped_sequence.append(mapping[event_id])
+        remapped_instances.append(clone_instance_with_sequence(inst, remapped_sequence))
+    return remapped_instances
 
 
 def split_instances_by_ratio(instances, ratio, rng):
@@ -299,21 +313,9 @@ def collect_event_ids(instances):
     return event_ids
 
 
-def filter_embeddings_by_event_ids(id2embed, event_ids):
-    return {
-        event_id: id2embed[event_id]
-        for event_id in sorted(event_ids)
-        if event_id in id2embed
-    }
-
-
 def count_exact_sequence_overlap(train_instances, test_instances):
     train_sequences = set(tuple(inst.sequence) for inst in train_instances)
     return sum(1 for inst in test_instances if tuple(inst.sequence) in train_sequences)
-
-
-def count_oov_events(instances, oov_event_id):
-    return sum(1 for inst in instances for event_id in inst.sequence if event_id == oov_event_id)
 
 
 def get_effective_training_label(instance):
@@ -775,28 +777,39 @@ def build_template_encoder(dataset):
     return Template_TF_IDF_without_clean() if dataset == 'NC' else Simple_template_TF_IDF()
 
 
-def prepare_dataset(dataset, parser_name, template_encoder):
+def build_semantic_encoder(parser_name, dataset, args=None):
+    if parser_name == 'parser_free':
+        cache_dir = get_protocol_option(args, 'plm_cache_dir', PARSER_FREE_DEFAULTS['cache_dir'])
+        return ParserFreeEncoder(
+            model_name=get_protocol_option(args, 'plm_model', PARSER_FREE_DEFAULTS['model_name']),
+            max_length=get_protocol_option(args, 'plm_max_length', PARSER_FREE_DEFAULTS['max_length']),
+            batch_size=get_protocol_option(args, 'plm_batch_size', PARSER_FREE_DEFAULTS['batch_size']),
+            pooling=get_protocol_option(args, 'plm_pooling', PARSER_FREE_DEFAULTS['pooling']),
+            cache_dir=cache_dir if cache_dir else None,
+        )
+    return build_template_encoder(dataset)
+
+
+def prepare_dataset(dataset, parser_name, semantic_encoder):
     processor = Preprocessor()
     instances, _, _ = processor.process(
         dataset=dataset,
         parsing=parser_name,
         cut_func=identity_cut,
-        template_encoding=template_encoder.present,
+        template_encoding=semantic_encoder,
     )
     return processor, instances
 
 
 def prepare_protocol_context(direction_key, parser_name, protocol='clean', args=None):
     direction = DIRECTION_CONFIGS[direction_key]
-    template_encoder = build_template_encoder(direction.source_dataset)
+    semantic_encoder = build_semantic_encoder(parser_name, direction.source_dataset, args)
 
-    source_processor, source_instances = prepare_dataset(direction.source_dataset, parser_name, template_encoder)
-    target_processor, target_instances = prepare_dataset(direction.target_dataset, parser_name, template_encoder)
+    source_processor, source_instances = prepare_dataset(direction.source_dataset, parser_name, semantic_encoder)
+    target_processor, target_instances = prepare_dataset(direction.target_dataset, parser_name, semantic_encoder)
 
     rng = np.random.RandomState(seed)
     force_fixed_threshold = False
-    use_full_source_embeddings = False
-    use_full_target_embeddings = False
     pseudo_label_metrics = None
     target_training_mode = 'none'
     selection_on_target_test = False
@@ -864,8 +877,6 @@ def prepare_protocol_context(direction_key, parser_name, protocol='clean', args=
         selection_split_name = 'source-dev' if source_dev_raw else 'source-train'
         target_embedding_raw = target_instances
         force_fixed_threshold = True
-        use_full_source_embeddings = True
-        use_full_target_embeddings = True
         target_training_mode = 'pseudo'
         selection_on_target_test = True
         pseudo_label_metrics = compute_effective_label_metrics(target_train_raw)
@@ -892,43 +903,22 @@ def prepare_protocol_context(direction_key, parser_name, protocol='clean', args=
     else:
         raise ValueError('Unknown protocol: %s' % protocol)
 
-    if use_full_source_embeddings:
-        source_embeddings = dict(source_processor.embedding)
-    else:
-        source_embeddings = filter_embeddings_by_event_ids(
-            source_processor.embedding,
-            collect_event_ids(source_train_raw),
-        )
-    if use_full_target_embeddings:
-        target_embeddings = dict(target_processor.embedding)
-    else:
-        target_embeddings = filter_embeddings_by_event_ids(
-            target_processor.embedding,
-            collect_event_ids(target_embedding_raw),
-        )
+    # Always build the merged embedding table from the full source/target event inventories.
+    # This removes train-vs-total vocabulary drift and avoids target-test OOV fallbacks.
+    source_embeddings = dict(source_processor.embedding)
+    target_embeddings = dict(target_processor.embedding)
     merged_embeddings, domain_mappings = build_merged_embeddings({
         direction.source_dataset: source_embeddings,
         direction.target_dataset: target_embeddings,
     })
 
-    target_oov_token = '__%s_target_oov__' % direction.target_dataset.lower()
     source_train = remap_instances(source_train_raw, domain_mappings[direction.source_dataset])
     source_dev = remap_instances(source_dev_raw, domain_mappings[direction.source_dataset])
     target_train = remap_instances(target_train_raw, domain_mappings[direction.target_dataset])
-    target_dev = remap_instances(
-        target_dev_raw,
-        domain_mappings[direction.target_dataset],
-        fallback_event_id=target_oov_token,
-    )
-    target_test = remap_instances(
-        target_test_raw,
-        domain_mappings[direction.target_dataset],
-        fallback_event_id=target_oov_token,
-    )
+    target_dev = remap_instances(target_dev_raw, domain_mappings[direction.target_dataset])
+    target_test = remap_instances(target_test_raw, domain_mappings[direction.target_dataset])
     exact_overlap = count_exact_sequence_overlap(target_train, target_test)
     exact_dev_overlap = count_exact_sequence_overlap(target_train, target_dev)
-    target_dev_oov_events = count_oov_events(target_dev, target_oov_token)
-    target_test_oov_events = count_oov_events(target_test, target_oov_token)
     if selection_on_target_test:
         selection_split = target_test
         selection_split_name = 'target-test'
@@ -956,14 +946,14 @@ def prepare_protocol_context(direction_key, parser_name, protocol='clean', args=
         'target_training_mode': target_training_mode,
         'warmup_select_by': warmup_select_by,
         'force_fixed_threshold': force_fixed_threshold,
-        'use_full_source_embeddings': use_full_source_embeddings,
-        'use_full_target_embeddings': use_full_target_embeddings,
+        'source_embedding_count': len(source_embeddings),
+        'target_embedding_count': len(target_embeddings),
         'selection_on_target_test': selection_on_target_test,
         'pseudo_label_metrics': pseudo_label_metrics,
         'exact_target_dev_overlap': exact_dev_overlap,
         'exact_target_overlap': exact_overlap,
-        'target_dev_oov_events': target_dev_oov_events,
-        'target_test_oov_events': target_test_oov_events,
+        'target_dev_oov_events': 0,
+        'target_test_oov_events': 0,
     }
 
 
@@ -1338,9 +1328,10 @@ def final_evaluate(context, args, checkpoint_path, threshold, use_moe=True):
 
 def default_run_name(args, direction_name):
     return (
-        '%s_protocol=%s_backbone=%s_hidden=%d_moe=e%d_k%d'
+        '%s_parser=%s_protocol=%s_backbone=%s_hidden=%d_moe=e%d_k%d'
         % (
             direction_name,
+            args.parser,
             args.protocol,
             args.backbone,
             lstm_hiddens,
@@ -1353,11 +1344,22 @@ def default_run_name(args, direction_name):
 def build_arg_parser():
     parser = argparse.ArgumentParser()
     parser.add_argument('--mode', type=str, default='train', help='train or test')
-    parser.add_argument('--parser', type=str, default='IBM', help='Log parser name.')
+    parser.add_argument('--parser', type=str, default='parser_free', choices=['parser_free', 'IBM'],
+                        help='Input pipeline to use.')
     parser.add_argument('--protocol', type=str, default='clean',
                         choices=['clean', 'clean_1pct_anomaly_only', 'metalog_repo_sample', 'metalog_repo_pseudo',
                                  'metalog_repo_full', 'zero_shot'],
                         help='Data split protocol.')
+    parser.add_argument('--plm_model', type=str, default=PARSER_FREE_DEFAULTS['model_name'],
+                        help='Hugging Face model name used by parser-free encoding.')
+    parser.add_argument('--plm_max_length', type=int, default=PARSER_FREE_DEFAULTS['max_length'],
+                        help='Maximum tokenizer length for parser-free log encoding.')
+    parser.add_argument('--plm_batch_size', type=int, default=PARSER_FREE_DEFAULTS['batch_size'],
+                        help='Batch size used when caching parser-free log embeddings.')
+    parser.add_argument('--plm_pooling', type=str, default=PARSER_FREE_DEFAULTS['pooling'],
+                        choices=['mean', 'cls'], help='Pooling strategy for parser-free log encoding.')
+    parser.add_argument('--plm_cache_dir', type=str, default=PARSER_FREE_DEFAULTS['cache_dir'],
+                        help='Optional cache directory for parser-free text embeddings.')
     parser.add_argument('--backbone', type=str, default='bimamba', help='gru or bimamba')
     parser.add_argument('--mamba_state', type=int, default=mamba_state, help='BiMamba state expansion.')
     parser.add_argument('--mamba_conv', type=int, default=mamba_conv, help='BiMamba convolution width.')
@@ -1464,12 +1466,12 @@ def run_direction(direction_key, args):
         )
     )
     logger.info(
-        'Target supervision=%s | effective target-train=%s | full embeddings source=%s target=%s | fixed threshold=%s'
+        'Target supervision=%s | effective target-train=%s | source embeddings=%d target embeddings=%d | fixed threshold=%s'
         % (
             context['target_training_mode'],
             label_summary(context['target_train'], use_training_labels=True),
-            'yes' if context['use_full_source_embeddings'] else 'no',
-            'yes' if context['use_full_target_embeddings'] else 'no',
+            context['source_embedding_count'],
+            context['target_embedding_count'],
             'yes' if context['force_fixed_threshold'] else 'no',
         )
     )
@@ -1488,12 +1490,10 @@ def run_direction(direction_key, args):
             )
         )
     logger.info(
-        'Leakage guard stats | target dev overlap=%d dev OOV=%d | target test overlap=%d test OOV=%d'
+        'Leakage guard stats | target dev overlap=%d | target test overlap=%d'
         % (
             context['exact_target_dev_overlap'],
-            context['target_dev_oov_events'],
             context['exact_target_overlap'],
-            context['target_test_oov_events'],
         )
     )
     if context['force_fixed_threshold'] and args.auto_threshold:

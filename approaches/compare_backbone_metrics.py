@@ -22,8 +22,8 @@ from approaches.MetaLog import (
 from approaches.supervised_protocol import load_checkpoint_state_dict, prepare_protocol_context
 
 
-def build_eval_context(parser_name, protocol):
-    context = prepare_protocol_context('hdfs_to_bgl', parser_name, protocol=protocol)
+def build_eval_context(parser_name, protocol, args=None):
+    context = prepare_protocol_context('hdfs_to_bgl', parser_name, protocol=protocol, args=args)
     return {
         'selection_split': context['selection_split'],
         'selection_split_name': context['selection_split_name'],
@@ -132,11 +132,22 @@ def write_results(output_file, results):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--parser', type=str, default='IBM', help='Log parser name.')
+    parser.add_argument('--parser', type=str, default='IBM', choices=['parser_free', 'IBM'],
+                        help='Input pipeline to use.')
     parser.add_argument('--protocol', type=str, default='clean',
                         choices=['clean', 'clean_1pct_anomaly_only', 'metalog_repo_sample', 'metalog_repo_pseudo',
                                  'metalog_repo_full', 'zero_shot'],
                         help='Data split protocol.')
+    parser.add_argument('--plm_model', type=str, default='bert-base-uncased',
+                        help='Hugging Face model name used by parser-free encoding.')
+    parser.add_argument('--plm_max_length', type=int, default=64,
+                        help='Maximum tokenizer length for parser-free log encoding.')
+    parser.add_argument('--plm_batch_size', type=int, default=64,
+                        help='Batch size used when caching parser-free log embeddings.')
+    parser.add_argument('--plm_pooling', type=str, default='mean', choices=['mean', 'cls'],
+                        help='Pooling strategy for parser-free log encoding.')
+    parser.add_argument('--plm_cache_dir', type=str, default='',
+                        help='Optional cache directory for parser-free text embeddings.')
     parser.add_argument('--threshold_min', type=float, default=0.5, help='Lower bound for dev threshold sweep.')
     parser.add_argument('--threshold_max', type=float, default=0.95, help='Upper bound for dev threshold sweep.')
     parser.add_argument('--threshold_step', type=float, default=0.005, help='Step size for dev threshold sweep.')
@@ -171,7 +182,7 @@ def main():
         'backbone_compare/%s_backbone_auc_metrics.tsv' % args.protocol,
     )
 
-    context = build_eval_context(args.parser, args.protocol)
+    context = build_eval_context(args.parser, args.protocol, args=args)
     results = [
         evaluate_backbone(
             context,

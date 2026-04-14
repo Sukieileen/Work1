@@ -28,6 +28,7 @@ class BasicDataLoader():
         self.block2seqs = {}
         self.block2label = {}
         self.block2eventseq = {}
+        self.log2message = {}
         self.id2embed = {}
         self.semantic_repr_func = None
 
@@ -128,6 +129,50 @@ class BasicDataLoader():
         self._prepare_semantic_embed(templates_embedding_file)
         self.logger.info('All data preparation finished in %.2f' % (time.time() - start_time))
 
+    def parse_by_parser_free(self, persistence_folder, normalizer):
+        if not callable(normalizer):
+            raise ValueError('Parser-free preprocessing requires a callable normalizer.')
+
+        self._restore()
+        if not os.path.exists(persistence_folder):
+            os.makedirs(persistence_folder)
+
+        log_event_seq_file = os.path.join(persistence_folder, 'log_sequences.txt')
+        log_event_mapping_file = os.path.join(persistence_folder, 'log_event_mapping.dict')
+        event_text_file = os.path.join(persistence_folder, 'event_texts.txt')
+        events_embedding_file = os.path.join(persistence_folder, 'events.vec')
+        start_time = time.time()
+
+        has_event_texts = self._check_file_existence_and_contents(event_text_file)
+        has_event_mapping = self._check_parsing_persistences(log_event_mapping_file, log_event_seq_file)
+        if has_event_texts and has_event_mapping:
+            self.logger.info('Start loading previous parser-free persistences.')
+            with open(event_text_file, 'r', encoding='utf-8') as reader:
+                self._load_templates(reader)
+            self.load_parsing_results(log_event_mapping_file, log_event_seq_file)
+        else:
+            self.logger.info('Parser-free persistences missing, start rebuilding from raw log text.')
+            self.log2message = self._load_log_messages()
+            event_text2id = {}
+            next_event_id = 1
+            for log_id in sorted(self.log2message.keys()):
+                normalized_text = normalizer(self.log2message[log_id])
+                if normalized_text not in event_text2id:
+                    event_text2id[normalized_text] = next_event_id
+                    self.templates[next_event_id] = normalized_text
+                    next_event_id += 1
+                self.log2temp[log_id] = event_text2id[normalized_text]
+
+            for block, seq in self.block2seqs.items():
+                self.block2eventseq[block] = [self.log2temp[log_id] for log_id in seq]
+
+            with open(event_text_file, 'w', encoding='utf-8') as writer:
+                self._save_templates(writer)
+            self._record_parsing_results(log_event_mapping_file, log_event_seq_file)
+
+        self._prepare_semantic_embed(events_embedding_file)
+        self.logger.info('All parser-free data preparation finished in %.2f' % (time.time() - start_time))
+
     def load_parsing_results(self, log_template_mapping_file, event_seq_file):
         self.logger.info('Start loading previous parsing results.')
         start = time.time()
@@ -143,6 +188,9 @@ class BasicDataLoader():
         self.block2emb = {}
         self.templates = {}
         self.log2temp = {}
+        self.block2eventseq = {}
+        self.id2embed = {}
+        self.log2message = {}
 
     def _save_log_event_seqs(self, writer):
         self.logger.info('Start saving log event sequences.')
@@ -239,3 +287,20 @@ class BasicDataLoader():
         (id, message) = line
         cluster = parser.match(message)
         self.log2temp[id] = cluster.cluster_id
+
+    def _iter_raw_log_files(self):
+        files = [self.in_file]
+        if hasattr(self, 'ab_in_file') and self.ab_in_file:
+            files.append(self.ab_in_file)
+        return files
+
+    def _load_log_messages(self):
+        log_messages = {}
+        log_id = 0
+        for input_file in self._iter_raw_log_files():
+            with open(input_file, 'r', encoding='utf-8') as reader:
+                for line in tqdm(reader.readlines()):
+                    log_messages[log_id] = self._pre_process(line)
+                    log_id += 1
+        self.logger.info('Loaded %d raw log messages for parser-free processing.' % len(log_messages))
+        return log_messages

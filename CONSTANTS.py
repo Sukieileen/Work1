@@ -60,5 +60,7 @@ PROJECT_ROOT = GET_PROJECT_ROOT()
 pretrained_mode_path = os.path.join(PROJECT_ROOT, 'outputs/models/pretrain')
 if not os.path.exists(pretrained_mode_path):
     os.makedirs(pretrained_mode_path)
-os.environ['TRANSFORMERS_CACHE'] = pretrained_mode_path
-os.environ['TRANSFORMERS_OFFLINE'] = '1'
+os.environ.setdefault('TRANSFORMERS_CACHE', pretrained_mode_path)
+os.environ.setdefault('HF_HOME', pretrained_mode_path)
+os.environ.setdefault('HF_HUB_DISABLE_TELEMETRY', '1')
+os.environ.setdefault('TRANSFORMERS_OFFLINE', '0')

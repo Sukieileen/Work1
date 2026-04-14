@@ -26,6 +26,8 @@ six==1.16.0
 subword-nmt==0.3.8
 threadpoolctl==2.2.0
 tqdm==4.62.3
+transformers==4.38.2
 typing-extensions==3.10.0.2
 typing-utils==0.1.0
 wheel==0.37.1
+safetensors==0.4.2

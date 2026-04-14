@@ -60,27 +60,35 @@ class Preprocessor:
         dataloader = None
         parser_config = None
         parser_persistence = os.path.join(PROJECT_ROOT, 'datasets/' + dataset + '/persistences')
+        semantic_repr_func = template_encoding.present if hasattr(template_encoding, 'present') else template_encoding
 
         if dataset == 'HDFS':
             dataloader = HDFSLoader(in_file=os.path.join(PROJECT_ROOT, 'datasets/HDFS/HDFS.log'),
-                                    semantic_repr_func=template_encoding)
+                                    semantic_repr_func=semantic_repr_func)
             parser_config = os.path.join(PROJECT_ROOT, 'conf/HDFS.ini')
         elif dataset == 'BGL' or dataset == 'BGLSample':
             in_file = os.path.join(PROJECT_ROOT, 'datasets/' + dataset + '/' + dataset + '.log')
             dataset_base = os.path.join(PROJECT_ROOT, 'datasets/' + dataset)
             dataloader = BGLLoader(in_file=in_file, dataset_base=dataset_base,
-                                   semantic_repr_func=template_encoding)
+                                   semantic_repr_func=semantic_repr_func)
             parser_config = os.path.join(PROJECT_ROOT, 'conf/BGL.ini')
         elif dataset == 'OpenStack':
             dataloader = OSLoader(in_file=os.path.join(PROJECT_ROOT, 'datasets/OpenStack/openstack_normal1.log'),
                                     ab_in_file=os.path.join(PROJECT_ROOT, 'datasets/OpenStack/openstack_abnormal.log'),
-                                    semantic_repr_func=template_encoding)
+                                    semantic_repr_func=semantic_repr_func)
             parser_config = os.path.join(PROJECT_ROOT, 'conf/OpenStack.ini')
 
         self.dataloader = dataloader
 
         if parsing == 'IBM':
             self.dataloader.parse_by_IBM(config_file=parser_config, persistence_folder=parser_persistence)
+        elif parsing == 'parser_free':
+            persistence_suffix = getattr(template_encoding, 'persistence_suffix', 'default')
+            parser_persistence = os.path.join(parser_persistence, 'parser_free', persistence_suffix)
+            self.dataloader.parse_by_parser_free(
+                persistence_folder=parser_persistence,
+                normalizer=template_encoding.normalize,
+            )
         else:
             self.logger.error('Parsing method %s not implemented yet.')
             raise NotImplementedError

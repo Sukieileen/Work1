@@ -101,7 +101,7 @@ class AttBiMambaModel(nn.Module):
         self.dropout = dropout
         self.use_moe = use_moe
         vocab_size, word_dims = vocab.vocab_size, vocab.word_dim
-        self.word_embed = CPUEmbedding(vocab_size, word_dims, padding_idx=vocab_size - 1)
+        self.word_embed = CPUEmbedding(vocab_size, word_dims, padding_idx=vocab.PAD)
         self.word_embed.weight.data.copy_(torch.from_numpy(vocab.embeddings))
         self.word_embed.weight.requires_grad = False
 

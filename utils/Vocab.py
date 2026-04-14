@@ -25,7 +25,7 @@ VocabLogger.info(
 
 class Vocab(object):
     ##please always set PAD to zero, otherwise will cause a bug in pad filling (Tensor)
-    PAD, START, END, UNK = 0, 1, 2, 3
+    PAD = 0
 
     def __init__(self):
         self._id2tag = []
@@ -45,12 +45,8 @@ class Vocab(object):
         :param id2embed:
         :return:
         '''
-        self._id2word = []
-        all_words = set()
-        for special_word in ['<pad>', '<bos>', '<eos>', '<oov>']:
-            if special_word not in all_words:
-                all_words.add(special_word)
-                self._id2word.append(special_word)
+        self._id2word = ['<pad>']
+        all_words = {'<pad>'}
         for word, embed in id2embed.items():
             self._embed_dim = embed.shape[0]
             all_words.add(word)
@@ -62,31 +58,17 @@ class Vocab(object):
         reverse = lambda x: dict(zip(x, range(len(x))))
         self._word2id = reverse(self._id2word)
 
-        oov_id = self._word2id.get('<oov>')
-        if self.UNK != oov_id:
-            VocabLogger.info("serious bug: oov word id is not correct, please check!")
-
         embeddings = np.zeros((word_num, self._embed_dim))
-        tem_count = 0
         for word, embed in id2embed.items():
             index = self._word2id.get(word)
             vector = np.array(embed, dtype=np.float64)
             embeddings[index] = vector
-            embeddings[self.UNK] += vector
-            tem_count += 1
-        if tem_count != word_num - 4:
-            VocabLogger.info("Goes wrong when calculating UNK emb!")
-        embeddings[self.UNK] = embeddings[self.UNK] / word_num
         self.embeddings = embeddings
 
     def load_pretrained_embs(self, embfile):
         embedding_dim = -1
-        self._id2word = []
-        allwords = set()
-        for special_word in ['<pad>', '<bos>', '<eos>', '<oov>']:
-            if special_word not in allwords:
-                allwords.add(special_word)
-                self._id2word.append(special_word)
+        self._id2word = ['<pad>']
+        allwords = {'<pad>'}
 
         with open(embfile, encoding='utf-8') as f:
             line = f.readline()
@@ -109,30 +91,20 @@ class Vocab(object):
         if len(self._word2id) != len(self._id2word):
             VocabLogger.info("serious bug: words dumplicated, please check!")
 
-        oov_id = self._word2id.get('<oov>')
-        if self.UNK != oov_id:
-            VocabLogger.info("serious bug: oov word id is not correct, please check!")
-
         embeddings = np.zeros((word_num, embedding_dim))
         with open(embfile, encoding='utf-8') as f:
-            # line = f.readline()
-            tem_count = 0
             for line in f.readlines():
                 values = line.split()
                 if len(values) == embedding_dim + 1:
                     index = self._word2id.get(values[0])
                     vector = np.array(values[1:], dtype='float64')
                     embeddings[index] = vector
-                    embeddings[self.UNK] += vector
-                    tem_count += 1
-        if tem_count != word_num - 4:
-            VocabLogger.info("Goes wrong when calculating UNK emb!")
-        embeddings[self.UNK] = embeddings[self.UNK] / word_num
+        self.embeddings = embeddings
 
     def word2id(self, xs):
         if isinstance(xs, list):
-            return [self._word2id.get(x, self.UNK) for x in xs]
-        return self._word2id.get(xs, self.UNK)
+            return [self._word2id[x] for x in xs]
+        return self._word2id[xs]
 
     def id2word(self, xs):
         if isinstance(xs, list):
