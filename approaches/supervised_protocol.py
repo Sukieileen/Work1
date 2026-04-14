@@ -12,9 +12,16 @@ from entities.TensorInstances import TInstWithLogits
 from entities.instances import Instance
 from models.gru import AttGRUModel
 from models.mamba import AttBiMambaModel
+from preprocessing.AutoLabeling import Probabilistic_Labeling
 from preprocessing.Preprocess import Preprocessor
+from representations.sequences.statistics import Sequential_TF
 from representations.templates.statistics import Simple_template_TF_IDF, Template_TF_IDF_without_clean
 from utils.Vocab import Vocab
+
+try:
+    from sklearn.decomposition import FastICA
+except ImportError:
+    FastICA = None
 
 try:
     from sklearn.metrics import average_precision_score, roc_auc_score
@@ -36,11 +43,6 @@ class DirectionConfig:
     name: str
     source_dataset: str
     target_dataset: str
-    source_train_ratio: float
-    source_dev_ratio: float
-    target_train_ratio: float
-    target_dev_ratio: float
-    target_train_anomaly_keep_ratio: float
 
 
 DIRECTION_CONFIGS = {
@@ -48,22 +50,47 @@ DIRECTION_CONFIGS = {
         name='hdfs_to_bgl',
         source_dataset='HDFS',
         target_dataset='BGL',
-        source_train_ratio=0.4,
-        source_dev_ratio=0.1,
-        target_train_ratio=0.3,
-        target_dev_ratio=0.1,
-        target_train_anomaly_keep_ratio=0.01,
     ),
     'bgl_to_hdfs': DirectionConfig(
         name='bgl_to_hdfs',
         source_dataset='BGL',
         target_dataset='HDFS',
-        source_train_ratio=1.0,
-        source_dev_ratio=0.0,
-        target_train_ratio=0.2,
-        target_dev_ratio=0.5,
-        target_train_anomaly_keep_ratio=0.01,
     ),
+}
+
+
+CLEAN_DIRECTION_CONFIGS = {
+    'hdfs_to_bgl': {
+        'source_ratio': 0.3,
+        'target_normal_ratio': 0.3,
+        'target_anomaly_ratio': 0.01,
+    },
+    'bgl_to_hdfs': {
+        'source_ratio': 1.0,
+        'target_normal_ratio': 0.1,
+        'target_anomaly_ratio': 0.01,
+    },
+}
+
+
+CLEAN_1PCT_ANOMALY_ONLY_DIRECTION_CONFIGS = {
+    'hdfs_to_bgl': {
+        'source_ratio': 0.3,
+        'target_normal_ratio': 0.0,
+        'target_anomaly_ratio': 0.01,
+    },
+    'bgl_to_hdfs': {
+        'source_ratio': 1.0,
+        'target_normal_ratio': 0.0,
+        'target_anomaly_ratio': 0.01,
+    },
+}
+
+PSEUDO_LABEL_DEFAULTS = {
+    'min_cluster_size': 100,
+    'min_samples': 100,
+    'reduce_dimension': 50,
+    'normal_fraction': 0.5,
 }
 
 
@@ -72,6 +99,12 @@ def sanitize_probs(tag_logits):
     tag_probs = torch.nan_to_num(tag_probs, nan=0.5, posinf=1.0, neginf=0.0)
     tag_probs = torch.clamp(tag_probs, min=1e-6, max=1 - 1e-6)
     return tag_probs
+
+
+def get_protocol_option(args, option_name, default_value):
+    if args is None:
+        return default_value
+    return getattr(args, option_name, default_value)
 
 
 def identity_cut(instances):
@@ -141,6 +174,62 @@ def remap_instances(instances, mapping, fallback_event_id=None):
     ]
 
 
+def split_instances_by_ratio(instances, ratio, rng):
+    shuffled = list(instances)
+    rng.shuffle(shuffled)
+    train_size = int(len(shuffled) * ratio)
+    return shuffled[:train_size], shuffled[train_size:]
+
+
+def split_instances_by_sequence_groups(instances, ratio, rng):
+    grouped_instances = {}
+    for inst in instances:
+        sequence_key = tuple(inst.sequence)
+        if sequence_key not in grouped_instances:
+            grouped_instances[sequence_key] = []
+        grouped_instances[sequence_key].append(inst)
+
+    grouped_instances = list(grouped_instances.values())
+    rng.shuffle(grouped_instances)
+    target_train_size = int(len(instances) * ratio)
+
+    train_instances = []
+    test_instances = []
+    current_train_size = 0
+    for group in grouped_instances:
+        group_size = len(group)
+        if current_train_size >= target_train_size:
+            test_instances.extend(group)
+            continue
+
+        deficit = target_train_size - current_train_size
+        overshoot = current_train_size + group_size - target_train_size
+        should_add_to_train = group_size <= deficit or deficit >= overshoot
+        if should_add_to_train:
+            train_instances.extend(group)
+            current_train_size += group_size
+        else:
+            test_instances.extend(group)
+
+    rng.shuffle(train_instances)
+    rng.shuffle(test_instances)
+    return train_instances, test_instances
+
+
+def split_instances_by_grouped_label_ratios(instances, normal_ratio, anomaly_ratio, rng):
+    normal_instances = [inst for inst in instances if inst.label == 'Normal']
+    anomaly_instances = [inst for inst in instances if inst.label == 'Anomalous']
+
+    normal_train, normal_test = split_instances_by_sequence_groups(normal_instances, normal_ratio, rng)
+    anomaly_train, anomaly_test = split_instances_by_sequence_groups(anomaly_instances, anomaly_ratio, rng)
+
+    train_instances = normal_train + anomaly_train
+    test_instances = normal_test + anomaly_test
+    rng.shuffle(train_instances)
+    rng.shuffle(test_instances)
+    return train_instances, test_instances
+
+
 def split_instances_by_ordered_prefix(instances, train_ratio, dev_ratio, rng):
     if train_ratio < 0 or dev_ratio < 0 or train_ratio + dev_ratio > 1:
         raise ValueError('train_ratio and dev_ratio must be non-negative and sum to at most 1.')
@@ -163,20 +252,44 @@ def keep_target_train_anomalies_by_ratio(instances, keep_ratio, rng):
     if keep_ratio < 0:
         raise ValueError('keep_ratio must be non-negative.')
 
-    anomaly_positions = [idx for idx, inst in enumerate(instances) if inst.label == 'Anomalous']
-    keep_count = int(len(anomaly_positions) * keep_ratio)
-    if keep_count >= len(anomaly_positions):
-        return list(instances)
+    kept_instances = []
+    for inst in instances:
+        if inst.label == 'Anomalous' and rng.rand() > keep_ratio:
+            continue
+        kept_instances.append(inst)
+    return kept_instances
 
-    kept_positions = set()
-    if keep_count > 0:
-        rng.shuffle(anomaly_positions)
-        kept_positions.update(anomaly_positions[:keep_count])
 
-    return [
-        inst for idx, inst in enumerate(instances)
-        if inst.label != 'Anomalous' or idx in kept_positions
-    ]
+def cut_all_metalog(instances, rng):
+    shuffled = list(instances)
+    rng.shuffle(shuffled)
+    return shuffled, [], []
+
+
+def cut_by_415_metalog(instances, rng):
+    return split_instances_by_ordered_prefix(instances, train_ratio=0.4, dev_ratio=0.1, rng=rng)
+
+
+def cut_by_316_filter_metalog(instances, rng):
+    train_instances, dev_instances, test_instances = split_instances_by_ordered_prefix(
+        instances,
+        train_ratio=0.3,
+        dev_ratio=0.1,
+        rng=rng,
+    )
+    train_instances = keep_target_train_anomalies_by_ratio(train_instances, keep_ratio=0.01, rng=rng)
+    return train_instances, dev_instances, test_instances
+
+
+def cut_by_253_filter_metalog(instances, rng):
+    train_instances, dev_instances, test_instances = split_instances_by_ordered_prefix(
+        instances,
+        train_ratio=0.2,
+        dev_ratio=0.5,
+        rng=rng,
+    )
+    train_instances = keep_target_train_anomalies_by_ratio(train_instances, keep_ratio=0.01, rng=rng)
+    return train_instances, dev_instances, test_instances
 
 
 def collect_event_ids(instances):
@@ -203,9 +316,131 @@ def count_oov_events(instances, oov_event_id):
     return sum(1 for inst in instances for event_id in inst.sequence if event_id == oov_event_id)
 
 
-def label_summary(instances):
-    counter = Counter(inst.label for inst in instances)
+def get_effective_training_label(instance):
+    predicted_label = getattr(instance, 'predicted', '')
+    return predicted_label if predicted_label else instance.label
+
+
+def label_summary(instances, use_training_labels=False):
+    if use_training_labels:
+        counter = Counter(get_effective_training_label(inst) for inst in instances)
+    else:
+        counter = Counter(inst.label for inst in instances)
     return '%d Normal / %d Anomalous' % (counter['Normal'], counter['Anomalous'])
+
+
+def split_has_both_labels(instances):
+    labels = {inst.label for inst in instances}
+    return 'Normal' in labels and 'Anomalous' in labels
+
+
+def compute_effective_label_metrics(instances):
+    TP, TN, FP, FN = 0, 0, 0, 0
+    for inst in instances:
+        predicted_label = get_effective_training_label(inst)
+        if predicted_label == 'Anomalous':
+            if inst.label == 'Anomalous':
+                TP += 1
+            else:
+                FP += 1
+        else:
+            if inst.label == 'Normal':
+                TN += 1
+            else:
+                FN += 1
+    precision = 100 * TP / (TP + FP) if TP + FP else 0.0
+    recall = 100 * TP / (TP + FN) if TP + FN else 0.0
+    f1 = 2 * precision * recall / (precision + recall) if precision + recall else 0.0
+    return {
+        'precision': precision,
+        'recall': recall,
+        'f1': f1,
+        'TP': TP,
+        'TN': TN,
+        'FP': FP,
+        'FN': FN,
+    }
+
+
+def format_float_for_path(value):
+    return ('%.3f' % value).replace('.', 'p')
+
+
+def build_pseudo_label_cache_paths(protocol, direction_key, target_dataset, parser_name, args):
+    reduce_dimension = get_protocol_option(args, 'pseudo_reduce_dimension', PSEUDO_LABEL_DEFAULTS['reduce_dimension'])
+    min_cluster_size = get_protocol_option(args, 'pseudo_min_cluster_size', PSEUDO_LABEL_DEFAULTS['min_cluster_size'])
+    min_samples = get_protocol_option(args, 'pseudo_min_samples', PSEUDO_LABEL_DEFAULTS['min_samples'])
+    normal_fraction = get_protocol_option(args, 'pseudo_normal_fraction', PSEUDO_LABEL_DEFAULTS['normal_fraction'])
+    cache_dir = os.path.join(
+        PROJECT_ROOT,
+        'outputs/results/supervised_protocol/pseudo_labels',
+        protocol,
+        '%s_%s_%s' % (direction_key, target_dataset, parser_name),
+        'rd=%s_mcs=%d_ms=%d_nf=%s' % (
+            str(reduce_dimension),
+            min_cluster_size,
+            min_samples,
+            format_float_for_path(normal_fraction),
+        ),
+    )
+    return (
+        os.path.join(cache_dir, 'label_res.txt'),
+        os.path.join(cache_dir, 'random_state.pkl'),
+    )
+
+
+def assign_instance_representations(instances, representations):
+    for index, inst in enumerate(instances):
+        inst.repr = representations[index]
+
+
+def build_pseudo_labeled_target_train(instances, processor, direction_key, parser_name, protocol, args):
+    if not instances:
+        return []
+
+    reduce_dimension = get_protocol_option(args, 'pseudo_reduce_dimension', PSEUDO_LABEL_DEFAULTS['reduce_dimension'])
+    min_cluster_size = get_protocol_option(args, 'pseudo_min_cluster_size', PSEUDO_LABEL_DEFAULTS['min_cluster_size'])
+    min_samples = get_protocol_option(args, 'pseudo_min_samples', PSEUDO_LABEL_DEFAULTS['min_samples'])
+    normal_fraction = get_protocol_option(args, 'pseudo_normal_fraction', PSEUDO_LABEL_DEFAULTS['normal_fraction'])
+
+    sequential_encoder = Sequential_TF(processor.embedding)
+    train_representations = sequential_encoder.present(instances)
+    assign_instance_representations(instances, train_representations)
+
+    if reduce_dimension != -1:
+        if FastICA is None:
+            raise ImportError('sklearn is required for pseudo labeling with dimensionality reduction.')
+        feature_dim = train_representations.shape[1] if train_representations.ndim > 1 else 1
+        n_components = min(reduce_dimension, len(instances), feature_dim)
+        if n_components <= 0:
+            raise ValueError('Pseudo labeling needs at least one target-train component.')
+        if n_components < feature_dim:
+            transformer = FastICA(n_components=n_components, random_state=seed)
+            reduced_representations = transformer.fit_transform(train_representations)
+            assign_instance_representations(instances, reduced_representations)
+
+    normal_indices = [index for index, inst in enumerate(instances) if inst.label == 'Normal']
+    if not normal_indices:
+        raise ValueError('Pseudo labeling requires at least one target-train normal instance.')
+    seed_normal_count = int(normal_fraction * len(normal_indices))
+    if seed_normal_count <= 0:
+        seed_normal_count = 1
+    normal_ids = normal_indices[:seed_normal_count]
+
+    label_res_file, random_state_file = build_pseudo_label_cache_paths(
+        protocol,
+        direction_key,
+        processor.dataset,
+        parser_name,
+        args,
+    )
+    label_generator = Probabilistic_Labeling(
+        min_samples=min_samples,
+        min_clust_size=min_cluster_size,
+        res_file=label_res_file,
+        rand_state_file=random_state_file,
+    )
+    return label_generator.auto_label(instances, normal_ids)
 
 
 def filter_trainable_parameters(parameters):
@@ -217,13 +452,15 @@ def set_parameter_trainability(parameters, requires_grad):
         parameter.requires_grad = requires_grad
 
 
-def build_supervised_tinsts(batch_insts, vocab):
+def build_training_tinsts(batch_insts, vocab):
     max_sequence_length = max(len(inst.sequence) for inst in batch_insts)
     tinst = TInstWithLogits(len(batch_insts), max_sequence_length, 2)
     for batch_index, inst in enumerate(batch_insts):
         tinst.src_ids.append(str(inst.id))
-        label_id = vocab.tag2id(inst.label)
-        tinst.tags[batch_index, label_id] = 1.0
+        label_id = vocab.tag2id(get_effective_training_label(inst))
+        confidence = min(max(0.5 * getattr(inst, 'confidence', 0.0), 0.0), 1.0)
+        tinst.tags[batch_index, label_id] = 1.0 - confidence
+        tinst.tags[batch_index, 1 - label_id] = confidence
         tinst.g_truth[batch_index] = label_id
         tinst.word_len[batch_index] = len(inst.sequence)
         for token_index, event_id in enumerate(inst.sequence[:500]):
@@ -253,8 +490,8 @@ class ReplacementBatchSampler:
     def __init__(self, instances, positive_fraction=0.5, seed_value=seed):
         self.positive_fraction = positive_fraction
         self.rng = np.random.RandomState(seed_value)
-        self.normal_instances = [inst for inst in instances if inst.label == 'Normal']
-        self.anomaly_instances = [inst for inst in instances if inst.label == 'Anomalous']
+        self.normal_instances = [inst for inst in instances if get_effective_training_label(inst) == 'Normal']
+        self.anomaly_instances = [inst for inst in instances if get_effective_training_label(inst) == 'Anomalous']
         self.all_instances = list(instances)
         if not self.all_instances:
             raise ValueError('ReplacementBatchSampler requires at least one instance.')
@@ -387,7 +624,7 @@ class MetaLog:
         return self.loss(tag_probs, targets)
 
     def compute_single_batch_loss(self, batch_insts):
-        tinst = build_supervised_tinsts(batch_insts, self.vocab)
+        tinst = build_training_tinsts(batch_insts, self.vocab)
         move_tinst_to_runtime_device(tinst)
         logits = self.model(tinst.inputs)
         cls_loss = self.classification_loss(logits, tinst.targets)
@@ -404,7 +641,7 @@ class MetaLog:
         return total_loss, metrics
 
     def compute_joint_batch_loss(self, source_batch, target_batch, target_weight):
-        tinst = build_supervised_tinsts(source_batch + target_batch, self.vocab)
+        tinst = build_training_tinsts(source_batch + target_batch, self.vocab)
         move_tinst_to_runtime_device(tinst)
         logits = self.model(tinst.inputs)
         source_batch_size = len(source_batch)
@@ -454,7 +691,7 @@ class MetaLog:
             self.model.eval()
             local_rng = np.random.RandomState(seed)
             for batch in iterate_batches(instances, 1024, local_rng, shuffle=False):
-                tinst = build_supervised_tinsts(batch, vocab)
+                tinst = build_training_tinsts(batch, vocab)
                 move_tinst_to_runtime_device(tinst)
                 tag_probs = sanitize_probs(self.model(tinst.inputs))
                 anomaly_scores.extend(tag_probs[:, anomaly_id].detach().cpu().numpy().tolist())
@@ -549,7 +786,7 @@ def prepare_dataset(dataset, parser_name, template_encoder):
     return processor, instances
 
 
-def prepare_protocol_context(direction_key, parser_name):
+def prepare_protocol_context(direction_key, parser_name, protocol='clean', args=None):
     direction = DIRECTION_CONFIGS[direction_key]
     template_encoder = build_template_encoder(direction.source_dataset)
 
@@ -557,32 +794,118 @@ def prepare_protocol_context(direction_key, parser_name):
     target_processor, target_instances = prepare_dataset(direction.target_dataset, parser_name, template_encoder)
 
     rng = np.random.RandomState(seed)
-    source_train_raw, source_dev_raw, _ = split_instances_by_ordered_prefix(
-        source_instances,
-        direction.source_train_ratio,
-        direction.source_dev_ratio,
-        rng,
-    )
-    target_train_raw, target_dev_raw, target_test_raw = split_instances_by_ordered_prefix(
-        target_instances,
-        direction.target_train_ratio,
-        direction.target_dev_ratio,
-        rng,
-    )
-    target_train_raw = keep_target_train_anomalies_by_ratio(
-        target_train_raw,
-        direction.target_train_anomaly_keep_ratio,
-        rng,
-    )
+    force_fixed_threshold = False
+    use_full_source_embeddings = False
+    use_full_target_embeddings = False
+    pseudo_label_metrics = None
+    target_training_mode = 'none'
+    selection_on_target_test = False
+    if protocol == 'clean':
+        clean_config = CLEAN_DIRECTION_CONFIGS[direction_key]
+        source_train_raw, _ = split_instances_by_ratio(source_instances, clean_config['source_ratio'], rng)
+        target_train_raw, target_test_raw = split_instances_by_grouped_label_ratios(
+            target_instances,
+            clean_config['target_normal_ratio'],
+            clean_config['target_anomaly_ratio'],
+            rng,
+        )
+        source_dev_raw = []
+        target_dev_raw = []
+        selection_domain = 'target'
+        selection_split_name = 'target-train'
+        target_embedding_raw = target_train_raw
+        target_training_mode = 'gold'
+    elif protocol == 'clean_1pct_anomaly_only':
+        clean_config = CLEAN_1PCT_ANOMALY_ONLY_DIRECTION_CONFIGS[direction_key]
+        source_train_raw, _ = split_instances_by_ratio(source_instances, clean_config['source_ratio'], rng)
+        target_train_raw, target_test_raw = split_instances_by_grouped_label_ratios(
+            target_instances,
+            clean_config['target_normal_ratio'],
+            clean_config['target_anomaly_ratio'],
+            rng,
+        )
+        source_dev_raw = []
+        target_dev_raw = []
+        selection_domain = 'target'
+        selection_split_name = 'target-train'
+        target_embedding_raw = target_train_raw
+        target_training_mode = 'gold-anomaly-only'
+    elif protocol == 'metalog_repo_sample':
+        if direction_key == 'hdfs_to_bgl':
+            source_train_raw, source_dev_raw, _ = cut_by_415_metalog(source_instances, rng)
+            target_train_raw, target_dev_raw, target_test_raw = cut_by_316_filter_metalog(target_instances, rng)
+        elif direction_key == 'bgl_to_hdfs':
+            source_train_raw, source_dev_raw, _ = cut_all_metalog(source_instances, rng)
+            target_train_raw, target_dev_raw, target_test_raw = cut_by_253_filter_metalog(target_instances, rng)
+        else:
+            raise ValueError('Unsupported direction for metalog_repo_sample: %s' % direction_key)
+        selection_domain = 'target'
+        selection_split_name = 'target-train'
+        target_embedding_raw = target_train_raw
+        target_training_mode = 'gold'
+    elif protocol == 'metalog_repo_pseudo':
+        if direction_key == 'hdfs_to_bgl':
+            source_train_raw, source_dev_raw, _ = cut_by_415_metalog(source_instances, rng)
+            target_train_raw, target_dev_raw, target_test_raw = cut_by_316_filter_metalog(target_instances, rng)
+        elif direction_key == 'bgl_to_hdfs':
+            source_train_raw, source_dev_raw, _ = cut_all_metalog(source_instances, rng)
+            target_train_raw, target_dev_raw, target_test_raw = cut_by_253_filter_metalog(target_instances, rng)
+        else:
+            raise ValueError('Unsupported direction for metalog_repo_pseudo: %s' % direction_key)
+        target_train_raw = build_pseudo_labeled_target_train(
+            target_train_raw,
+            target_processor,
+            direction_key,
+            parser_name,
+            protocol,
+            args,
+        )
+        selection_domain = 'source'
+        selection_split_name = 'source-dev' if source_dev_raw else 'source-train'
+        target_embedding_raw = target_instances
+        force_fixed_threshold = True
+        use_full_source_embeddings = True
+        use_full_target_embeddings = True
+        target_training_mode = 'pseudo'
+        selection_on_target_test = True
+        pseudo_label_metrics = compute_effective_label_metrics(target_train_raw)
+    elif protocol == 'zero_shot':
+        if direction_key == 'hdfs_to_bgl':
+            source_train_raw, source_dev_raw, _ = cut_by_415_metalog(source_instances, rng)
+        elif direction_key == 'bgl_to_hdfs':
+            source_train_raw, source_dev_raw, _ = cut_all_metalog(source_instances, rng)
+        else:
+            raise ValueError('Unsupported direction for zero_shot: %s' % direction_key)
+        target_train_raw = []
+        target_dev_raw = []
+        target_test_raw = list(target_instances)
+        selection_domain = 'source'
+        selection_split_name = 'source-dev' if source_dev_raw else 'source-train'
+        # Zero-shot avoids target supervision during training/calibration while still
+        # allowing the evaluator to represent unseen target templates at test time.
+        target_embedding_raw = target_test_raw
+    elif protocol == 'metalog_repo_full':
+        raise NotImplementedError(
+            'protocol=metalog_repo_full is intentionally left unimplemented for now; '
+            'please use clean or metalog_repo_sample.'
+        )
+    else:
+        raise ValueError('Unknown protocol: %s' % protocol)
 
-    source_embeddings = filter_embeddings_by_event_ids(
-        source_processor.embedding,
-        collect_event_ids(source_train_raw),
-    )
-    target_embeddings = filter_embeddings_by_event_ids(
-        target_processor.embedding,
-        collect_event_ids(target_train_raw),
-    )
+    if use_full_source_embeddings:
+        source_embeddings = dict(source_processor.embedding)
+    else:
+        source_embeddings = filter_embeddings_by_event_ids(
+            source_processor.embedding,
+            collect_event_ids(source_train_raw),
+        )
+    if use_full_target_embeddings:
+        target_embeddings = dict(target_processor.embedding)
+    else:
+        target_embeddings = filter_embeddings_by_event_ids(
+            target_processor.embedding,
+            collect_event_ids(target_embedding_raw),
+        )
     merged_embeddings, domain_mappings = build_merged_embeddings({
         direction.source_dataset: source_embeddings,
         direction.target_dataset: target_embeddings,
@@ -606,12 +929,20 @@ def prepare_protocol_context(direction_key, parser_name):
     exact_dev_overlap = count_exact_sequence_overlap(target_train, target_dev)
     target_dev_oov_events = count_oov_events(target_dev, target_oov_token)
     target_test_oov_events = count_oov_events(target_test, target_oov_token)
+    if selection_on_target_test:
+        selection_split = target_test
+        selection_split_name = 'target-test'
+        warmup_select_by = 'selection_f1'
+    else:
+        selection_split = target_train if selection_domain == 'target' else (source_dev if source_dev else source_train)
+        warmup_select_by = 'selection_f1' if selection_domain == 'source' else 'loss'
 
     vocab = Vocab()
     vocab.load_from_dict(merged_embeddings)
 
     return {
         'direction': direction,
+        'protocol': protocol,
         'vocab': vocab,
         'label2id': target_processor.label2id,
         'source_train': source_train,
@@ -619,10 +950,16 @@ def prepare_protocol_context(direction_key, parser_name):
         'target_train': target_train,
         'target_dev': target_dev,
         'target_test': target_test,
-        # Keep threshold tuning on target_train so we do not consume extra target labels
-        # beyond what the original MetaLog training loop exposed.
-        'selection_split': target_train,
-        'selection_split_name': 'target-train',
+        'selection_split': selection_split,
+        'selection_split_name': selection_split_name,
+        'uses_target_training': bool(target_train),
+        'target_training_mode': target_training_mode,
+        'warmup_select_by': warmup_select_by,
+        'force_fixed_threshold': force_fixed_threshold,
+        'use_full_source_embeddings': use_full_source_embeddings,
+        'use_full_target_embeddings': use_full_target_embeddings,
+        'selection_on_target_test': selection_on_target_test,
+        'pseudo_label_metrics': pseudo_label_metrics,
         'exact_target_dev_overlap': exact_dev_overlap,
         'exact_target_overlap': exact_overlap,
         'target_dev_oov_events': target_dev_oov_events,
@@ -696,7 +1033,14 @@ def log_epoch_summary(logger, phase_name, epoch, metrics):
 def evaluate_target(metalog, context, args, split_name):
     selection_split = context['selection_split']
     selection_split_name = context['selection_split_name']
-    if args.auto_threshold:
+    use_auto_threshold = args.auto_threshold and not context.get('force_fixed_threshold', False)
+    if use_auto_threshold and not split_has_both_labels(selection_split):
+        metalog.logger.info(
+            'Selection split %s only has a single label; falling back to fixed threshold %.3f.'
+            % (selection_split_name, args.threshold)
+        )
+        use_auto_threshold = False
+    if use_auto_threshold:
         threshold, selection_metrics = metalog.tune_threshold(
             selection_split,
             context['vocab'],
@@ -732,7 +1076,7 @@ def maybe_record_epoch_metrics(args, direction_name, phase_name, epoch, threshol
     })
 
 
-def run_warmup(context, args, checkpoint_prefix):
+def run_warmup(context, args, checkpoint_prefix, select_by='loss'):
     metalog = MetaLog(
         context['vocab'],
         num_layer,
@@ -747,7 +1091,7 @@ def run_warmup(context, args, checkpoint_prefix):
         use_moe=False,
     )
     optimizer = build_warmup_optimizer(metalog, args)
-    best_loss = None
+    best_value = None
     best_checkpoint = checkpoint_prefix + '_phaseA_best.pt'
     last_checkpoint = checkpoint_prefix + '_phaseA_last.pt'
 
@@ -771,7 +1115,14 @@ def run_warmup(context, args, checkpoint_prefix):
             'threshold': threshold,
         })
         save_model_state(metalog.model, last_checkpoint)
-        is_best = best_loss is None or mean_loss < best_loss
+        if select_by == 'loss':
+            current_value = mean_loss
+            is_best = best_value is None or current_value < best_value
+        elif select_by == 'selection_f1':
+            current_value = selection_metrics['f']
+            is_best = best_value is None or current_value > best_value
+        else:
+            raise ValueError('Unknown warmup selection rule: %s' % select_by)
         maybe_record_epoch_metrics(
             args,
             context['direction'].name,
@@ -784,7 +1135,7 @@ def run_warmup(context, args, checkpoint_prefix):
             phase_mean_loss=mean_loss,
         )
         if is_best:
-            best_loss = mean_loss
+            best_value = current_value
             save_model_state(metalog.model, best_checkpoint)
 
     return best_checkpoint
@@ -947,7 +1298,7 @@ def run_calibration(context, args, checkpoint_prefix, joint_checkpoint):
     return best_checkpoint, best_threshold
 
 
-def final_evaluate(context, args, checkpoint_path, threshold):
+def final_evaluate(context, args, checkpoint_path, threshold, use_moe=True):
     metalog = MetaLog(
         context['vocab'],
         num_layer,
@@ -959,7 +1310,7 @@ def final_evaluate(context, args, checkpoint_path, threshold):
         mamba_conv=args.mamba_conv,
         mamba_expand=args.mamba_expand,
         mamba_variant=args.mamba_variant,
-        use_moe=True,
+        use_moe=use_moe,
         moe_num_experts=args.moe_num_experts,
         moe_top_k=args.moe_top_k,
         moe_bottleneck_dim=args.moe_bottleneck_dim,
@@ -987,9 +1338,10 @@ def final_evaluate(context, args, checkpoint_path, threshold):
 
 def default_run_name(args, direction_name):
     return (
-        '%s_backbone=%s_hidden=%d_moe=e%d_k%d'
+        '%s_protocol=%s_backbone=%s_hidden=%d_moe=e%d_k%d'
         % (
             direction_name,
+            args.protocol,
             args.backbone,
             lstm_hiddens,
             args.moe_num_experts,
@@ -1002,6 +1354,10 @@ def build_arg_parser():
     parser = argparse.ArgumentParser()
     parser.add_argument('--mode', type=str, default='train', help='train or test')
     parser.add_argument('--parser', type=str, default='IBM', help='Log parser name.')
+    parser.add_argument('--protocol', type=str, default='clean',
+                        choices=['clean', 'clean_1pct_anomaly_only', 'metalog_repo_sample', 'metalog_repo_pseudo',
+                                 'metalog_repo_full', 'zero_shot'],
+                        help='Data split protocol.')
     parser.add_argument('--backbone', type=str, default='bimamba', help='gru or bimamba')
     parser.add_argument('--mamba_state', type=int, default=mamba_state, help='BiMamba state expansion.')
     parser.add_argument('--mamba_conv', type=int, default=mamba_conv, help='BiMamba convolution width.')
@@ -1031,6 +1387,14 @@ def build_arg_parser():
     parser.add_argument('--threshold_min', type=float, default=0.1, help='Lower bound for threshold sweep.')
     parser.add_argument('--threshold_max', type=float, default=0.9, help='Upper bound for threshold sweep.')
     parser.add_argument('--threshold_step', type=float, default=0.01, help='Step size for threshold sweep.')
+    parser.add_argument('--pseudo_min_cluster_size', type=int, default=PSEUDO_LABEL_DEFAULTS['min_cluster_size'],
+                        help='Pseudo-label HDBSCAN min_cluster_size for protocol=metalog_repo_pseudo.')
+    parser.add_argument('--pseudo_min_samples', type=int, default=PSEUDO_LABEL_DEFAULTS['min_samples'],
+                        help='Pseudo-label HDBSCAN min_samples for protocol=metalog_repo_pseudo.')
+    parser.add_argument('--pseudo_reduce_dimension', type=int, default=PSEUDO_LABEL_DEFAULTS['reduce_dimension'],
+                        help='FastICA dimension used before pseudo labeling; -1 disables reduction.')
+    parser.add_argument('--pseudo_normal_fraction', type=float, default=PSEUDO_LABEL_DEFAULTS['normal_fraction'],
+                        help='Fraction of target-train normals used as pseudo-label normal seeds.')
     parser.add_argument('--run_name', type=str, default='', help='Optional checkpoint prefix.')
     parser.add_argument('--checkpoint', type=str, default='',
                         help='Checkpoint path used when mode=test.')
@@ -1057,12 +1421,12 @@ def build_arg_parser():
 
 def run_direction(direction_key, args):
     args.moe_bottleneck_dim = args.moe_bottleneck_dim if args.moe_bottleneck_dim > 0 else None
-    context = prepare_protocol_context(direction_key, args.parser)
+    context = prepare_protocol_context(direction_key, args.parser, protocol=args.protocol, args=args)
     log_prefix = args.run_name if args.run_name else default_run_name(args, direction_key)
     output_model_dir = os.path.join(
         PROJECT_ROOT,
-        'outputs/models/protocol_%s/%s_%s/model' % (
-            direction_key,
+        'outputs/models/%s/%s_%s/model' % (
+            args.protocol,
             context['direction'].target_dataset,
             args.parser,
         ),
@@ -1071,9 +1435,10 @@ def run_direction(direction_key, args):
 
     logger = MetaLog._logger
     logger.info(
-        'Prepared %s | source %s train=%d (%s) dev=%d (%s) | target %s train=%d (%s) dev=%d (%s) test=%d (%s)'
+        'Prepared %s | protocol=%s | source %s train=%d (%s) dev=%d (%s) | target %s train=%d (%s) dev=%d (%s) test=%d (%s)'
         % (
             direction_key,
+            context['protocol'],
             context['direction'].source_dataset,
             len(context['source_train']),
             label_summary(context['source_train']),
@@ -1089,6 +1454,40 @@ def run_direction(direction_key, args):
         )
     )
     logger.info(
+        'Selection split=%s size=%d (%s) | target used in training=%s | selection leaks target test=%s'
+        % (
+            context['selection_split_name'],
+            len(context['selection_split']),
+            label_summary(context['selection_split']),
+            'yes' if context['uses_target_training'] else 'no',
+            'yes' if context['selection_on_target_test'] else 'no',
+        )
+    )
+    logger.info(
+        'Target supervision=%s | effective target-train=%s | full embeddings source=%s target=%s | fixed threshold=%s'
+        % (
+            context['target_training_mode'],
+            label_summary(context['target_train'], use_training_labels=True),
+            'yes' if context['use_full_source_embeddings'] else 'no',
+            'yes' if context['use_full_target_embeddings'] else 'no',
+            'yes' if context['force_fixed_threshold'] else 'no',
+        )
+    )
+    if context['pseudo_label_metrics'] is not None:
+        pseudo_metrics = context['pseudo_label_metrics']
+        logger.info(
+            'Target pseudo-label quality | precision=%.4f recall=%.4f f1=%.4f | TP=%d TN=%d FP=%d FN=%d'
+            % (
+                pseudo_metrics['precision'],
+                pseudo_metrics['recall'],
+                pseudo_metrics['f1'],
+                pseudo_metrics['TP'],
+                pseudo_metrics['TN'],
+                pseudo_metrics['FP'],
+                pseudo_metrics['FN'],
+            )
+        )
+    logger.info(
         'Leakage guard stats | target dev overlap=%d dev OOV=%d | target test overlap=%d test OOV=%d'
         % (
             context['exact_target_dev_overlap'],
@@ -1097,13 +1496,16 @@ def run_direction(direction_key, args):
             context['target_test_oov_events'],
         )
     )
+    if context['force_fixed_threshold'] and args.auto_threshold:
+        logger.info('Protocol %s forces fixed threshold %.3f; ignoring --auto_threshold.' % (context['protocol'], args.threshold))
 
     if args.mode == 'test':
         checkpoint_path = args.checkpoint
         if not checkpoint_path:
             raise ValueError('mode=test requires --checkpoint.')
         threshold = args.threshold
-        if args.auto_threshold:
+        use_moe = context['uses_target_training']
+        if args.auto_threshold and not context['force_fixed_threshold']:
             evaluator = MetaLog(
                 context['vocab'],
                 num_layer,
@@ -1115,7 +1517,7 @@ def run_direction(direction_key, args):
                 mamba_conv=args.mamba_conv,
                 mamba_expand=args.mamba_expand,
                 mamba_variant=args.mamba_variant,
-                use_moe=True,
+                use_moe=use_moe,
                 moe_num_experts=args.moe_num_experts,
                 moe_top_k=args.moe_top_k,
                 moe_bottleneck_dim=args.moe_bottleneck_dim if args.moe_bottleneck_dim > 0 else None,
@@ -1134,10 +1536,38 @@ def run_direction(direction_key, args):
                 threshold_step=args.threshold_step,
                 split_name=context['selection_split_name'],
             )
-        final_evaluate(context, args, checkpoint_path, threshold)
+        final_evaluate(context, args, checkpoint_path, threshold, use_moe=use_moe)
         return
 
-    warmup_checkpoint = run_warmup(context, args, checkpoint_prefix)
+    warmup_checkpoint = run_warmup(context, args, checkpoint_prefix, select_by=context['warmup_select_by'])
+    if not context['uses_target_training']:
+        threshold = args.threshold
+        if args.auto_threshold and not context['force_fixed_threshold']:
+            evaluator = MetaLog(
+                context['vocab'],
+                num_layer,
+                lstm_hiddens,
+                context['label2id'],
+                backbone=args.backbone,
+                dropout=args.dropout,
+                mamba_state=args.mamba_state,
+                mamba_conv=args.mamba_conv,
+                mamba_expand=args.mamba_expand,
+                mamba_variant=args.mamba_variant,
+                use_moe=False,
+            )
+            evaluator.load_model_state(warmup_checkpoint)
+            threshold, _ = evaluator.tune_threshold(
+                context['selection_split'],
+                context['vocab'],
+                threshold_min=args.threshold_min,
+                threshold_max=args.threshold_max,
+                threshold_step=args.threshold_step,
+                split_name=context['selection_split_name'],
+            )
+        final_evaluate(context, args, warmup_checkpoint, threshold, use_moe=False)
+        return
+
     _, _, joint_last_checkpoint = run_joint_finetune(context, args, checkpoint_prefix, warmup_checkpoint)
     calibration_checkpoint, calibration_threshold = run_calibration(
         context,
@@ -1145,4 +1575,4 @@ def run_direction(direction_key, args):
         checkpoint_prefix,
         joint_last_checkpoint,
     )
-    final_evaluate(context, args, calibration_checkpoint, calibration_threshold)
+    final_evaluate(context, args, calibration_checkpoint, calibration_threshold, use_moe=True)

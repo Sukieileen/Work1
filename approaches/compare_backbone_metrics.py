@@ -22,14 +22,15 @@ from approaches.MetaLog import (
 from approaches.supervised_protocol import load_checkpoint_state_dict, prepare_protocol_context
 
 
-def build_eval_context(parser_name):
-    context = prepare_protocol_context('hdfs_to_bgl', parser_name)
+def build_eval_context(parser_name, protocol):
+    context = prepare_protocol_context('hdfs_to_bgl', parser_name, protocol=protocol)
     return {
         'selection_split': context['selection_split'],
         'selection_split_name': context['selection_split_name'],
         'test_split': context['target_test'],
         'vocab': context['vocab'],
         'label2id': context['label2id'],
+        'force_fixed_threshold': context.get('force_fixed_threshold', False),
     }
 
 
@@ -59,14 +60,23 @@ def evaluate_backbone(context, backbone_name, checkpoint_path, threshold_min, th
 
     metalog.model.load_state_dict(load_checkpoint_state_dict(checkpoint_path))
 
-    tuned_threshold, selection_metrics = metalog.tune_threshold(
-        context['selection_split'],
-        context['vocab'],
-        threshold_min=threshold_min,
-        threshold_max=threshold_max,
-        threshold_step=threshold_step,
-        split_name=context['selection_split_name'],
-    )
+    selection_has_both_labels = len({inst.label for inst in context['selection_split']}) >= 2
+    if context['force_fixed_threshold'] or not selection_has_both_labels:
+        tuned_threshold = 0.5
+        selection_metrics = metalog.evaluate_metrics(
+            context['selection_split'],
+            threshold=tuned_threshold,
+            vocab=context['vocab'],
+        )
+    else:
+        tuned_threshold, selection_metrics = metalog.tune_threshold(
+            context['selection_split'],
+            context['vocab'],
+            threshold_min=threshold_min,
+            threshold_max=threshold_max,
+            threshold_step=threshold_step,
+            split_name=context['selection_split_name'],
+        )
 
     anomaly_scores, gold_labels = metalog.collect_anomaly_scores(context['test_split'], context['vocab'])
     test_metrics = metalog._binary_metrics_from_scores(gold_labels, anomaly_scores, tuned_threshold)
@@ -123,6 +133,10 @@ def write_results(output_file, results):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--parser', type=str, default='IBM', help='Log parser name.')
+    parser.add_argument('--protocol', type=str, default='clean',
+                        choices=['clean', 'clean_1pct_anomaly_only', 'metalog_repo_sample', 'metalog_repo_pseudo',
+                                 'metalog_repo_full', 'zero_shot'],
+                        help='Data split protocol.')
     parser.add_argument('--threshold_min', type=float, default=0.5, help='Lower bound for dev threshold sweep.')
     parser.add_argument('--threshold_max', type=float, default=0.95, help='Upper bound for dev threshold sweep.')
     parser.add_argument('--threshold_step', type=float, default=0.005, help='Step size for dev threshold sweep.')
@@ -147,15 +161,17 @@ def main():
     parser.add_argument(
         '--output_file',
         type=str,
-        default=os.path.join(
-            PROJECT_ROOT,
-            'backbone_compare/backbone_auc_metrics.tsv',
-        ),
+        default='',
         help='Where to write the comparison results.',
     )
     args = parser.parse_args()
 
-    context = build_eval_context(args.parser)
+    output_file = args.output_file if args.output_file else os.path.join(
+        PROJECT_ROOT,
+        'backbone_compare/%s_backbone_auc_metrics.tsv' % args.protocol,
+    )
+
+    context = build_eval_context(args.parser, args.protocol)
     results = [
         evaluate_backbone(
             context,
@@ -174,7 +190,7 @@ def main():
             args.threshold_step,
         ),
     ]
-    write_results(args.output_file, results)
+    write_results(output_file, results)
 
     for result in results:
         print(
@@ -189,7 +205,7 @@ def main():
                 result['test_aucpr'],
             )
         )
-    print('Saved comparison file to %s' % args.output_file)
+    print('Saved comparison file to %s' % output_file)
 
 
 if __name__ == '__main__':
