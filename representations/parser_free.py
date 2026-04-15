@@ -41,10 +41,11 @@ def _build_logger():
 
 
 class LogNormalizer(object):
-    VERSION = 'v1'
+    VERSION = 'v4'
 
-    def __init__(self, lowercase=True):
+    def __init__(self, lowercase=True, dataset=None):
         self.lowercase = lowercase
+        self.dataset = dataset.upper() if dataset else ''
         self.uuid_re = re.compile(
             r'\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b',
             re.IGNORECASE,
@@ -68,6 +69,28 @@ class LogNormalizer(object):
         ]
         self.separator_re = re.compile(r'[^\w<>]+')
         self.space_re = re.compile(r'\s+')
+        self.bgl_datetime_re = re.compile(
+            r'\b(?:mon|tue|wed|thu|fri|sat|sun)\s+'
+            r'(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)\s+'
+            r'\d{1,2}\s+\d{2}:\d{2}:\d{2}\s+[a-z]{3}\s+\d{4}\b',
+            re.IGNORECASE,
+        )
+        self.bgl_colon_hexseq_re = re.compile(r'\b(?:[0-9a-f]{2}:){3,}[0-9a-f]{2}\b', re.IGNORECASE)
+        self.bgl_location_re = re.compile(r'\br\d{2}(?:-[a-z0-9]+)+(?::j\d{1,2}-u\d{1,2})?\b', re.IGNORECASE)
+        self.bgl_slot_re = re.compile(r'(?<!\w)(?:j|u)\d{1,2}(?!\w)', re.IGNORECASE)
+        self.bgl_hex8_re = re.compile(
+            r'\b(?=[0-9a-f]{8}\b)(?=[0-9a-f]*\d)(?=[0-9a-f]*[a-f])[0-9a-f]{8}\b',
+            re.IGNORECASE,
+        )
+        self.bgl_long_hex_re = re.compile(
+            r'\b(?=[0-9a-f]{6,}\b)(?=[0-9a-f]*\d)(?=[0-9a-f]*[a-f])[0-9a-f]{6,}\b',
+            re.IGNORECASE,
+        )
+        self.bgl_assignment_re = re.compile(r'([a-z][a-z0-9_]*)\s*(?:=|:)\s*([0-9a-f]{4,})\b', re.IGNORECASE)
+        self.bgl_location_token_re = re.compile(r'^r\d{2}(?:-[a-z0-9]+)+(?::j\d{1,2}-u\d{1,2})?$', re.IGNORECASE)
+        self.bgl_slot_token_re = re.compile(r'^(?:j|u)\d{1,2}$', re.IGNORECASE)
+        self.bgl_long_hex_token_re = re.compile(r'^[0-9a-f]{5,}$', re.IGNORECASE)
+        self.bgl_short_hex_token_re = re.compile(r'^[0-9a-f]{2}$', re.IGNORECASE)
 
     def normalize(self, text):
         if text is None:
@@ -87,6 +110,8 @@ class LogNormalizer(object):
         text = self.port_phrase_re.sub(' port <port> ', text)
         text = self.path_re.sub(' <path> ', text)
         text = self.hex_re.sub(' <hex> ', text)
+        if self.dataset == 'BGL':
+            text = self._normalize_bgl(text)
         for compiled_re in self.id_res:
             text = compiled_re.sub(' <id> ', text)
         text = self.float_re.sub(' <num> ', text)
@@ -95,17 +120,71 @@ class LogNormalizer(object):
         text = self.space_re.sub(' ', text).strip()
         return text if text else '<empty>'
 
+    def _normalize_bgl(self, text):
+        text = self.bgl_datetime_re.sub(' <datetime> ', text)
+        text = self.bgl_colon_hexseq_re.sub(' <hexseq> ', text)
+        text = self.bgl_location_re.sub(' <loc> ', text)
+        text = self.bgl_slot_re.sub(' <slot> ', text)
+        text = self.bgl_hex8_re.sub(lambda match: ' %s ' % self._bucket_bgl_hex(match.group(0)), text)
+        text = self.bgl_long_hex_re.sub(' <hex> ', text)
+        text = self.bgl_assignment_re.sub(r'\1 <hex>', text)
+        tokens = text.split()
+        normalized_tokens = []
+        token_index = 0
+        while token_index < len(tokens):
+            token = tokens[token_index]
+            lowered_token = token.lower()
+
+            if self.bgl_location_token_re.fullmatch(lowered_token):
+                normalized_tokens.append('<loc>')
+                token_index += 1
+                continue
+
+            if self.bgl_slot_token_re.fullmatch(lowered_token):
+                normalized_tokens.append('<slot>')
+                token_index += 1
+                continue
+
+            hex_run_end = token_index
+            saw_alpha_hex = False
+            while hex_run_end < len(tokens):
+                run_token = tokens[hex_run_end].lower()
+                if not self.bgl_short_hex_token_re.fullmatch(run_token):
+                    break
+                if any(ch in 'abcdef' for ch in run_token):
+                    saw_alpha_hex = True
+                hex_run_end += 1
+            if hex_run_end - token_index >= 4 and saw_alpha_hex:
+                normalized_tokens.append('<hexseq>')
+                token_index = hex_run_end
+                continue
+
+            if self.bgl_long_hex_token_re.fullmatch(lowered_token):
+                normalized_tokens.append('<hex>')
+                token_index += 1
+                continue
+
+            normalized_tokens.append(token)
+            token_index += 1
+
+        return ' '.join(normalized_tokens)
+
+    def _bucket_bgl_hex(self, token):
+        lowered = token.lower()
+        return '<hexp_%s>' % lowered[:4]
+
 
 class ParserFreeEncoder(object):
     def __init__(self, model_name='bert-base-uncased', max_length=64, batch_size=64, pooling='mean',
-                 cache_dir=None, lowercase=True):
+                 cache_dir=None, lowercase=True, dataset=None):
         self.model_name = model_name
         self.max_length = max_length
         self.batch_size = batch_size
         self.pooling = pooling
+        self.dataset = dataset.upper() if dataset else ''
         self.runtime_device = device
         self.logger = _build_logger()
-        self.normalizer = LogNormalizer(lowercase=lowercase)
+        self.normalizer = LogNormalizer(lowercase=lowercase, dataset=self.dataset)
         cache_root = cache_dir if cache_dir else os.path.join(PROJECT_ROOT, 'outputs/parser_free_cache')
         if not os.path.exists(cache_root):
             os.makedirs(cache_root)
@@ -117,6 +196,7 @@ class ParserFreeEncoder(object):
             'pooling': self.pooling,
             'normalizer_version': self.normalizer.VERSION,
             'lowercase': lowercase,
+            'dataset': self.dataset,
         }
         signature_json = json.dumps(self.config_signature, sort_keys=True)
         self.persistence_suffix = hashlib.md5(signature_json.encode('utf-8')).hexdigest()[:12]

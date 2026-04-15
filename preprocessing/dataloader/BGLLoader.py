@@ -16,21 +16,22 @@ class BGLLoader(BasicDataLoader):
         # Construct logger.
         self.logger = logging.getLogger('BGLLoader')
         self.logger.setLevel(logging.DEBUG)
-        console_handler = logging.StreamHandler(sys.stderr)
-        console_handler.setLevel(logging.DEBUG)
-        console_handler.setFormatter(
-            logging.Formatter("%(asctime)s - %(name)s - " + SESSION + " - %(levelname)s: %(message)s"))
+        if not self.logger.handlers:
+            console_handler = logging.StreamHandler(sys.stderr)
+            console_handler.setLevel(logging.DEBUG)
+            console_handler.setFormatter(
+                logging.Formatter("%(asctime)s - %(name)s - " + SESSION + " - %(levelname)s: %(message)s"))
 
-        file_handler = logging.FileHandler(os.path.join(LOG_ROOT, 'BGLLoader.log'))
-        file_handler.setLevel(logging.INFO)
-        file_handler.setFormatter(
-            logging.Formatter("%(asctime)s - %(name)s - " + SESSION + " - %(levelname)s: %(message)s"))
+            file_handler = logging.FileHandler(os.path.join(LOG_ROOT, 'BGLLoader.log'))
+            file_handler.setLevel(logging.INFO)
+            file_handler.setFormatter(
+                logging.Formatter("%(asctime)s - %(name)s - " + SESSION + " - %(levelname)s: %(message)s"))
 
-        self.logger.addHandler(console_handler)
-        self.logger.addHandler(file_handler)
-        self.logger.info(
-            'Construct self.logger success, current working directory: %s, logs will be written in %s' %
-            (os.getcwd(), LOG_ROOT))
+            self.logger.addHandler(console_handler)
+            self.logger.addHandler(file_handler)
+            self.logger.info(
+                'Construct self.logger success, current working directory: %s, logs will be written in %s' %
+                (os.getcwd(), LOG_ROOT))
 
         if not os.path.exists(in_file):
             self.logger.error('Input file not found, please check.')

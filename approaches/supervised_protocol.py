@@ -455,7 +455,8 @@ def set_parameter_trainability(parameters, requires_grad):
 
 
 def build_training_tinsts(batch_insts, vocab):
-    max_sequence_length = max(len(inst.sequence) for inst in batch_insts)
+    max_tokens = 500
+    max_sequence_length = max(min(len(inst.sequence), max_tokens) for inst in batch_insts)
     tinst = TInstWithLogits(len(batch_insts), max_sequence_length, 2)
     for batch_index, inst in enumerate(batch_insts):
         tinst.src_ids.append(str(inst.id))
@@ -464,8 +465,9 @@ def build_training_tinsts(batch_insts, vocab):
         tinst.tags[batch_index, label_id] = 1.0 - confidence
         tinst.tags[batch_index, 1 - label_id] = confidence
         tinst.g_truth[batch_index] = label_id
-        tinst.word_len[batch_index] = len(inst.sequence)
-        for token_index, event_id in enumerate(inst.sequence[:500]):
+        effective_length = min(len(inst.sequence), max_tokens)
+        tinst.word_len[batch_index] = effective_length
+        for token_index, event_id in enumerate(inst.sequence[:max_tokens]):
             tinst.src_words[batch_index, token_index] = vocab.word2id(event_id)
             tinst.src_masks[batch_index, token_index] = 1
     return tinst
@@ -786,6 +788,7 @@ def build_semantic_encoder(parser_name, dataset, args=None):
             batch_size=get_protocol_option(args, 'plm_batch_size', PARSER_FREE_DEFAULTS['batch_size']),
             pooling=get_protocol_option(args, 'plm_pooling', PARSER_FREE_DEFAULTS['pooling']),
             cache_dir=cache_dir if cache_dir else None,
+            dataset=dataset,
         )
     return build_template_encoder(dataset)
 
@@ -803,10 +806,19 @@ def prepare_dataset(dataset, parser_name, semantic_encoder):
 
 def prepare_protocol_context(direction_key, parser_name, protocol='clean', args=None):
     direction = DIRECTION_CONFIGS[direction_key]
-    semantic_encoder = build_semantic_encoder(parser_name, direction.source_dataset, args)
+    source_semantic_encoder = build_semantic_encoder(parser_name, direction.source_dataset, args)
+    target_semantic_encoder = build_semantic_encoder(parser_name, direction.target_dataset, args)
 
-    source_processor, source_instances = prepare_dataset(direction.source_dataset, parser_name, semantic_encoder)
-    target_processor, target_instances = prepare_dataset(direction.target_dataset, parser_name, semantic_encoder)
+    source_processor, source_instances = prepare_dataset(
+        direction.source_dataset,
+        parser_name,
+        source_semantic_encoder,
+    )
+    target_processor, target_instances = prepare_dataset(
+        direction.target_dataset,
+        parser_name,
+        target_semantic_encoder,
+    )
 
     rng = np.random.RandomState(seed)
     force_fixed_threshold = False
@@ -954,6 +966,8 @@ def prepare_protocol_context(direction_key, parser_name, protocol='clean', args=
         'exact_target_overlap': exact_overlap,
         'target_dev_oov_events': 0,
         'target_test_oov_events': 0,
+        'source_persistence_suffix': getattr(source_semantic_encoder, 'persistence_suffix', ''),
+        'target_persistence_suffix': getattr(target_semantic_encoder, 'persistence_suffix', ''),
     }
 
 
@@ -1475,6 +1489,16 @@ def run_direction(direction_key, args):
             'yes' if context['force_fixed_threshold'] else 'no',
         )
     )
+    if args.parser == 'parser_free':
+        logger.info(
+            'Parser-free persistences | %s=%s | %s=%s'
+            % (
+                context['direction'].source_dataset,
+                context['source_persistence_suffix'],
+                context['direction'].target_dataset,
+                context['target_persistence_suffix'],
+            )
+        )
     if context['pseudo_label_metrics'] is not None:
         pseudo_metrics = context['pseudo_label_metrics']
         logger.info(

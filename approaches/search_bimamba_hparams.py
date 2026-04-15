@@ -73,21 +73,44 @@ def read_epoch_rows(epoch_csv):
     return rows
 
 
+def phase_priority(phase_name):
+    return {
+        'phase_a': 1,
+        'phase_b': 2,
+        'phase_c': 3,
+    }.get(phase_name, 0)
+
+
+def parse_metric(row, key):
+    value = row.get(key, '')
+    return float(value) if value else float('nan')
+
+
+def select_best_epoch_row(rows):
+    candidate_rows = [row for row in rows if row.get('selected_for_best') == '1']
+    if not candidate_rows:
+        candidate_rows = rows
+    best_phase = max(phase_priority(row.get('phase', '')) for row in candidate_rows)
+    candidate_rows = [row for row in candidate_rows if phase_priority(row.get('phase', '')) == best_phase]
+    return max(
+        candidate_rows,
+        key=lambda row: (
+            parse_metric(row, 'selection_f1'),
+            parse_metric(row, 'test_aucpr'),
+            parse_metric(row, 'test_auroc'),
+        ),
+    )
+
+
 def summarize_trial(stage_name, trial_index, config, train_epochs, run_name, epoch_csv, log_file):
     rows = read_epoch_rows(epoch_csv)
     if not rows:
         raise RuntimeError('No epoch metrics found in %s' % epoch_csv)
-    best_row = max(
-        rows,
-        key=lambda row: (
-            float(row['dev_f1']) if row['dev_f1'] else float('-inf'),
-            float(row['f1']),
-            float(row['aucpr']),
-        ),
-    )
+    best_row = select_best_epoch_row(rows)
     return {
         'stage': stage_name,
         'trial_index': trial_index,
+        'phase': best_row['phase'],
         'run_name': run_name,
         'epochs': train_epochs,
         'model_lr': config['model_lr'],
@@ -97,12 +120,13 @@ def summarize_trial(stage_name, trial_index, config, train_epochs, run_name, epo
         'mamba_expand': config['mamba_expand'],
         'best_epoch': int(best_row['epoch']),
         'selected_threshold': float(best_row['selected_threshold']),
-        'best_dev_f1': float(best_row['dev_f1']) if best_row['dev_f1'] else float('nan'),
-        'test_precision': float(best_row['precision']),
-        'test_recall': float(best_row['recall']),
-        'test_f1': float(best_row['f1']),
-        'test_auroc': float(best_row['auroc']),
-        'test_aucpr': float(best_row['aucpr']),
+        'best_selection_f1': parse_metric(best_row, 'selection_f1'),
+        'best_dev_f1': parse_metric(best_row, 'selection_f1'),
+        'test_precision': parse_metric(best_row, 'test_precision'),
+        'test_recall': parse_metric(best_row, 'test_recall'),
+        'test_f1': parse_metric(best_row, 'test_f1'),
+        'test_auroc': parse_metric(best_row, 'test_auroc'),
+        'test_aucpr': parse_metric(best_row, 'test_aucpr'),
         'epoch_csv': str(epoch_csv),
         'log_file': str(log_file),
     }
@@ -112,9 +136,9 @@ def write_summary_csv(summary_file, rows):
     if not rows:
         return
     fieldnames = [
-        'stage', 'trial_index', 'run_name', 'epochs', 'model_lr', 'dropout', 'mamba_state', 'mamba_conv',
-        'mamba_expand', 'best_epoch', 'selected_threshold', 'best_dev_f1', 'test_precision', 'test_recall',
-        'test_f1', 'test_auroc', 'test_aucpr', 'epoch_csv', 'log_file',
+        'stage', 'trial_index', 'phase', 'run_name', 'epochs', 'model_lr', 'dropout', 'mamba_state', 'mamba_conv',
+        'mamba_expand', 'best_epoch', 'selected_threshold', 'best_selection_f1', 'best_dev_f1',
+        'test_precision', 'test_recall', 'test_f1', 'test_auroc', 'test_aucpr', 'epoch_csv', 'log_file',
     ]
     with summary_file.open('w', encoding='utf-8', newline='') as writer:
         csv_writer = csv.DictWriter(writer, fieldnames=fieldnames)
@@ -126,7 +150,7 @@ def write_summary_csv(summary_file, rows):
             })
 
 
-def run_trial(base_dir, stage_name, trial_index, config, train_epochs, resume):
+def run_trial(base_dir, stage_name, trial_index, config, train_epochs, resume, args):
     run_name = run_name_for(stage_name, trial_index, config, train_epochs)
     metrics_file = epoch_csv_path(base_dir, run_name)
     trial_log = log_path(base_dir, run_name)
@@ -136,21 +160,35 @@ def run_trial(base_dir, stage_name, trial_index, config, train_epochs, resume):
         if rows:
             return summarize_trial(stage_name, trial_index, config, train_epochs, run_name, metrics_file, trial_log)
 
+    base_lr = config['model_lr']
     cmd = [
         'conda', 'run', '--no-capture-output', '-n', 'work1',
         'python', 'approaches/MetaLog.py',
         '--mode', 'train',
+        '--parser', args.parser,
+        '--protocol', args.protocol,
         '--backbone', 'bimamba',
         '--auto_threshold',
-        '--threshold_min', '0.50',
-        '--threshold_max', '0.95',
-        '--threshold_step', '0.005',
-        '--model_lr', str(config['model_lr']),
-        '--epochs', str(train_epochs),
+        '--threshold_min', str(args.threshold_min),
+        '--threshold_max', str(args.threshold_max),
+        '--threshold_step', str(args.threshold_step),
+        '--warmup_epochs', str(args.warmup_epochs),
+        '--joint_epochs', str(train_epochs),
+        '--calibration_epochs', str(args.calibration_epochs),
+        '--warmup_lr', str(base_lr),
+        '--joint_backbone_lr', str(base_lr),
+        '--joint_gate_lr', str(base_lr * 5.0),
+        '--joint_expert_lr', str(base_lr * 5.0),
+        '--calibration_gate_lr', str(base_lr * 2.0),
+        '--calibration_expert_lr', str(base_lr * 2.0),
         '--dropout', str(config['dropout']),
         '--mamba_state', str(config['mamba_state']),
         '--mamba_conv', str(config['mamba_conv']),
         '--mamba_expand', str(config['mamba_expand']),
+        '--plm_model', args.plm_model,
+        '--plm_max_length', str(args.plm_max_length),
+        '--plm_batch_size', str(args.plm_batch_size),
+        '--plm_pooling', args.plm_pooling,
         '--run_name', run_name,
         '--epoch_metrics_file', str(metrics_file),
     ]
@@ -174,7 +212,7 @@ def run_trial(base_dir, stage_name, trial_index, config, train_epochs, resume):
 def select_top_trials(stage_rows, top_k):
     ranked = sorted(
         stage_rows,
-        key=lambda row: (row['best_dev_f1'], row['test_aucpr'], row['test_auroc']),
+        key=lambda row: (row['best_selection_f1'], row['test_aucpr'], row['test_auroc']),
         reverse=True,
     )
     return ranked[:top_k]
@@ -200,11 +238,31 @@ def write_search_plan(plan_file, configs, stage_name, train_epochs):
 
 def main():
     parser = argparse.ArgumentParser()
+    parser.add_argument('--parser', type=str, default='parser_free', choices=['parser_free', 'IBM'],
+                        help='Input pipeline used by MetaLog.py during search.')
+    parser.add_argument('--protocol', type=str, default='clean',
+                        choices=['clean', 'clean_1pct_anomaly_only', 'metalog_repo_sample', 'metalog_repo_pseudo',
+                                 'metalog_repo_full', 'zero_shot'],
+                        help='Data split protocol used during search.')
+    parser.add_argument('--plm_model', type=str, default='bert-base-uncased',
+                        help='Hugging Face model name used when parser=parser_free.')
+    parser.add_argument('--plm_max_length', type=int, default=64,
+                        help='Maximum tokenizer length used when parser=parser_free.')
+    parser.add_argument('--plm_batch_size', type=int, default=64,
+                        help='PLM batch size used when parser=parser_free.')
+    parser.add_argument('--plm_pooling', type=str, default='mean', choices=['mean', 'cls'],
+                        help='Pooling strategy used when parser=parser_free.')
     parser.add_argument('--stage1_trials', type=int, default=8, help='How many random configs to test in stage 1.')
-    parser.add_argument('--stage1_epochs', type=int, default=6, help='Epochs for the coarse search stage.')
+    parser.add_argument('--stage1_epochs', type=int, default=6, help='Joint phase epochs for the coarse search stage.')
     parser.add_argument('--stage2_top_k', type=int, default=3, help='How many configs to promote to stage 2.')
-    parser.add_argument('--stage2_epochs', type=int, default=12, help='Epochs for the refinement stage.')
+    parser.add_argument('--stage2_epochs', type=int, default=12, help='Joint phase epochs for the refinement stage.')
+    parser.add_argument('--warmup_epochs', type=int, default=5, help='Warmup phase epochs shared by all trials.')
+    parser.add_argument('--calibration_epochs', type=int, default=3,
+                        help='Calibration phase epochs shared by all trials.')
     parser.add_argument('--seed', type=int, default=42, help='Random seed used to sample stage 1 configs.')
+    parser.add_argument('--threshold_min', type=float, default=0.50, help='Lower bound for threshold sweep.')
+    parser.add_argument('--threshold_max', type=float, default=0.95, help='Upper bound for threshold sweep.')
+    parser.add_argument('--threshold_step', type=float, default=0.005, help='Step size for threshold sweep.')
     parser.add_argument(
         '--search_dir',
         type=str,
@@ -223,7 +281,7 @@ def main():
 
     stage1_rows = []
     for idx, config in enumerate(stage1_configs):
-        stage1_rows.append(run_trial(base_dir, 'stage1', idx, config, args.stage1_epochs, args.resume))
+        stage1_rows.append(run_trial(base_dir, 'stage1', idx, config, args.stage1_epochs, args.resume, args))
         write_summary_csv(base_dir / 'summaries' / 'stage1_summary.csv', stage1_rows)
 
     promoted_rows = select_top_trials(stage1_rows, args.stage2_top_k)
@@ -241,7 +299,7 @@ def main():
 
     stage2_rows = []
     for idx, config in enumerate(promoted_configs):
-        stage2_rows.append(run_trial(base_dir, 'stage2', idx, config, args.stage2_epochs, args.resume))
+        stage2_rows.append(run_trial(base_dir, 'stage2', idx, config, args.stage2_epochs, args.resume, args))
         write_summary_csv(base_dir / 'summaries' / 'stage2_summary.csv', stage2_rows)
 
     combined_rows = stage1_rows + stage2_rows
@@ -251,8 +309,8 @@ def main():
         best_stage2 = select_top_trials(stage2_rows, 1)[0]
         with (base_dir / 'summaries' / 'best_stage2.txt').open('w', encoding='utf-8') as writer:
             for key in [
-                'run_name', 'epochs', 'model_lr', 'dropout', 'mamba_state', 'mamba_conv', 'mamba_expand',
-                'best_epoch', 'selected_threshold', 'best_dev_f1', 'test_precision', 'test_recall',
+                'run_name', 'phase', 'epochs', 'model_lr', 'dropout', 'mamba_state', 'mamba_conv', 'mamba_expand',
+                'best_epoch', 'selected_threshold', 'best_selection_f1', 'best_dev_f1', 'test_precision', 'test_recall',
                 'test_f1', 'test_auroc', 'test_aucpr', 'epoch_csv', 'log_file',
             ]:
                 writer.write('%s: %s\n' % (key, best_stage2[key]))

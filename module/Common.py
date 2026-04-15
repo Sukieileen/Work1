@@ -34,10 +34,11 @@ def data_iter(data, batch_size, shuffle=True):
 
 
 def generate_tinsts_binary_label(batch_insts, vocab, if_evaluate=False):
-    slen = len(batch_insts[0].sequence)
+    max_tokens = 500
+    slen = min(len(batch_insts[0].sequence), max_tokens)
     batch_size = len(batch_insts)
     for b in range(1, batch_size):
-        cur_slen = len(batch_insts[b].sequence)
+        cur_slen = min(len(batch_insts[b].sequence), max_tokens)
         if cur_slen > slen: slen = cur_slen
     tinst = TInstWithLogits(batch_size, slen, 2)
     b = 0
@@ -49,11 +50,9 @@ def generate_tinsts_binary_label(batch_insts, vocab, if_evaluate=False):
         tinst.tags[b, vocab.tag2id(inst.predicted)] = 1 - confidence
         tinst.tags[b, 1 - vocab.tag2id(inst.predicted)] = confidence
         tinst.g_truth[b] = vocab.tag2id(inst.predicted)
-        cur_slen = len(inst.sequence)
+        cur_slen = min(len(inst.sequence), max_tokens)
         tinst.word_len[b] = cur_slen
         for index in range(cur_slen):
-            if index >= 500:
-                break
             tinst.src_words[b, index] = vocab.word2id(inst.sequence[index])
             tinst.src_masks[b, index] = 1
         b += 1

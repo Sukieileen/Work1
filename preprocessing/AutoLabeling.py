@@ -16,21 +16,22 @@ class Probabilistic_Labeling():
                 os.makedirs(folder)
         ProbLabelLogger = logging.getLogger('Prob_Label')
         ProbLabelLogger.setLevel(logging.DEBUG)
-        console_handler = logging.StreamHandler(sys.stderr)
-        console_handler.setLevel(logging.DEBUG)
-        console_handler.setFormatter(
-            logging.Formatter("%(asctime)s - %(name)s - " + SESSION + " - %(levelname)s: %(message)s"))
+        if not ProbLabelLogger.handlers:
+            console_handler = logging.StreamHandler(sys.stderr)
+            console_handler.setLevel(logging.DEBUG)
+            console_handler.setFormatter(
+                logging.Formatter("%(asctime)s - %(name)s - " + SESSION + " - %(levelname)s: %(message)s"))
 
-        file_handler = logging.FileHandler(os.path.join(LOG_ROOT, 'Prob_Label.log'))
-        file_handler.setLevel(logging.INFO)
-        file_handler.setFormatter(
-            logging.Formatter("%(asctime)s - %(name)s - " + SESSION + " - %(levelname)s: %(message)s"))
+            file_handler = logging.FileHandler(os.path.join(LOG_ROOT, 'Prob_Label.log'))
+            file_handler.setLevel(logging.INFO)
+            file_handler.setFormatter(
+                logging.Formatter("%(asctime)s - %(name)s - " + SESSION + " - %(levelname)s: %(message)s"))
 
-        ProbLabelLogger.addHandler(console_handler)
-        ProbLabelLogger.addHandler(file_handler)
-        ProbLabelLogger.info(
-            'Construct logger for Probabilistic labeling succeeded, current working directory: %s, logs will be written in %s' %
-            (os.getcwd(), LOG_ROOT))
+            ProbLabelLogger.addHandler(console_handler)
+            ProbLabelLogger.addHandler(file_handler)
+            ProbLabelLogger.info(
+                'Construct logger for Probabilistic labeling succeeded, current working directory: %s, logs will be written in %s' %
+                (os.getcwd(), LOG_ROOT))
 
         self.logger = ProbLabelLogger
 

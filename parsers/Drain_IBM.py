@@ -31,21 +31,22 @@ class Drain3Parser():
         # Dispose Loggers.
         DrainLogger = logging.getLogger('drain')
         DrainLogger.setLevel(logging.DEBUG)
-        console_handler = logging.StreamHandler(sys.stderr)
-        console_handler.setLevel(logging.DEBUG)
-        console_handler.setFormatter(
-            logging.Formatter("%(asctime)s - %(name)s - " + SESSION + " - %(levelname)s: %(message)s"))
+        if not DrainLogger.handlers:
+            console_handler = logging.StreamHandler(sys.stderr)
+            console_handler.setLevel(logging.DEBUG)
+            console_handler.setFormatter(
+                logging.Formatter("%(asctime)s - %(name)s - " + SESSION + " - %(levelname)s: %(message)s"))
 
-        file_handler = logging.FileHandler(os.path.join(LOG_ROOT, 'drain.log'))
-        file_handler.setLevel(logging.INFO)
-        file_handler.setFormatter(
-            logging.Formatter("%(asctime)s - %(name)s - " + SESSION + " - %(levelname)s: %(message)s"))
+            file_handler = logging.FileHandler(os.path.join(LOG_ROOT, 'drain.log'))
+            file_handler.setLevel(logging.INFO)
+            file_handler.setFormatter(
+                logging.Formatter("%(asctime)s - %(name)s - " + SESSION + " - %(levelname)s: %(message)s"))
 
-        DrainLogger.addHandler(console_handler)
-        DrainLogger.addHandler(file_handler)
-        DrainLogger.info(
-            'Construct DrainLogger success, current working directory: %s, logs will be written in %s' %
-            (os.getcwd(), LOG_ROOT))
+            DrainLogger.addHandler(console_handler)
+            DrainLogger.addHandler(file_handler)
+            DrainLogger.info(
+                'Construct DrainLogger success, current working directory: %s, logs will be written in %s' %
+                (os.getcwd(), LOG_ROOT))
         return DrainLogger
 
     def parse_file(self, in_file, remove_cols=None, clean=False):

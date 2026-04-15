@@ -34,6 +34,7 @@ def main():
         batch_size=args.plm_batch_size,
         pooling=args.plm_pooling,
         cache_dir=args.plm_cache_dir if args.plm_cache_dir else None,
+        dataset=args.dataset,
     )
     processor = Preprocessor()
     train, dev, test = processor.process(

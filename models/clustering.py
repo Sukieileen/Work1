@@ -13,21 +13,22 @@ class Solitary_HDBSCAN():
         # Dispose Loggers.
         HDBSCANLogger = logging.getLogger('Solitary_HDBSCAN')
         HDBSCANLogger.setLevel(logging.DEBUG)
-        console_handler = logging.StreamHandler(sys.stderr)
-        console_handler.setLevel(logging.DEBUG)
-        console_handler.setFormatter(
-            logging.Formatter("%(asctime)s - %(name)s - " + SESSION + " - %(levelname)s: %(message)s"))
+        if not HDBSCANLogger.handlers:
+            console_handler = logging.StreamHandler(sys.stderr)
+            console_handler.setLevel(logging.DEBUG)
+            console_handler.setFormatter(
+                logging.Formatter("%(asctime)s - %(name)s - " + SESSION + " - %(levelname)s: %(message)s"))
 
-        file_handler = logging.FileHandler(os.path.join(LOG_ROOT, 'Solitary_HDBSCAN.log'))
-        file_handler.setLevel(logging.INFO)
-        file_handler.setFormatter(
-            logging.Formatter("%(asctime)s - %(name)s - " + SESSION + " - %(levelname)s: %(message)s"))
+            file_handler = logging.FileHandler(os.path.join(LOG_ROOT, 'Solitary_HDBSCAN.log'))
+            file_handler.setLevel(logging.INFO)
+            file_handler.setFormatter(
+                logging.Formatter("%(asctime)s - %(name)s - " + SESSION + " - %(levelname)s: %(message)s"))
 
-        HDBSCANLogger.addHandler(console_handler)
-        HDBSCANLogger.addHandler(file_handler)
-        HDBSCANLogger.info(
-            'Construct logger for Solitary_HDBSCAN succeeded, current working directory: %s, logs will be written in %s' %
-            (os.getcwd(), LOG_ROOT))
+            HDBSCANLogger.addHandler(console_handler)
+            HDBSCANLogger.addHandler(file_handler)
+            HDBSCANLogger.info(
+                'Construct logger for Solitary_HDBSCAN succeeded, current working directory: %s, logs will be written in %s' %
+                (os.getcwd(), LOG_ROOT))
 
         self.logger = HDBSCANLogger
         self.min_cluster_size = min_cluster_size
@@ -135,4 +136,3 @@ class Solitary_HDBSCAN():
             'Found %d normal, %d anomalous by normal clusters' % (by_normal_core_normal, by_normal_core_anomalous))
         self.logger.info('Found %d normal, %d anomalous by minimum distances' % (by_dist_normal, by_dist_anomalous))
         return predicted
-

@@ -26,6 +26,8 @@ class Preprocessor:
         # Dispose Loggers.
         PreprocessorLogger = logging.getLogger('Preprocessor')
         PreprocessorLogger.setLevel(logging.DEBUG)
+        if PreprocessorLogger.handlers:
+            return PreprocessorLogger
         console_handler = logging.StreamHandler(sys.stderr)
         console_handler.setLevel(logging.DEBUG)
         console_handler.setFormatter(
