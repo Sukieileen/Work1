@@ -38,7 +38,7 @@ SESSION = 'SESSION_' + SESSION
 
 def GET_PROJECT_ROOT():
     # goto the root folder of LogBar
-    current_abspath = os.path.abspath('__file__')
+    current_abspath = os.path.abspath(__file__)
     while True:
         if os.path.split(current_abspath)[1] == 'MetaLog':
             project_root = current_abspath

@@ -30,7 +30,9 @@ class AttGRUModel(nn.Module):
 
     def __init__(self, vocab, lstm_layers, lstm_hiddens, dropout=0, use_moe=False, moe_num_experts=4,
                  moe_top_k=2, moe_bottleneck_dim=None, moe_temperature=1.5, moe_gate_dropout=0.1,
-                 moe_balance_loss_weight=1e-2, moe_diversity_loss_weight=1e-3, moe_z_loss_weight=0.0):
+                 moe_balance_loss_weight=1e-2, moe_diversity_loss_weight=1e-3, moe_z_loss_weight=0.0,
+                 use_normality_anchor=True, prototype_scale=1.0, prototype_margin_global=1.0,
+                 prototype_margin_expert=1.0, router_use_distance=True):
         super(AttGRUModel, self).__init__()
         self.dropout = dropout
         self.use_moe = use_moe
@@ -62,9 +64,15 @@ class AttGRUModel(nn.Module):
                 balance_loss_weight=moe_balance_loss_weight,
                 diversity_loss_weight=moe_diversity_loss_weight,
                 z_loss_weight=moe_z_loss_weight,
+                use_normality_anchor=use_normality_anchor,
+                prototype_scale=prototype_scale,
+                prototype_margin_global=prototype_margin_global,
+                prototype_margin_expert=prototype_margin_expert,
+                router_use_distance=router_use_distance,
             )
             self.logger.info('MoE Enabled: experts=%d, top_k=%d, bottleneck_dim=%s, temperature=%.3f, '
-                             'balance_weight=%.4g, diversity_weight=%.4g, z_weight=%.4g'
+                             'balance_weight=%.4g, diversity_weight=%.4g, z_weight=%.4g, '
+                             'normality_anchor=%s, prototype_scale=%.3f, router_use_distance=%s'
                              % (
                                  moe_num_experts,
                                  min(moe_top_k, moe_num_experts),
@@ -73,6 +81,9 @@ class AttGRUModel(nn.Module):
                                  moe_balance_loss_weight,
                                  moe_diversity_loss_weight,
                                  moe_z_loss_weight,
+                                 'on' if use_normality_anchor else 'off',
+                                 prototype_scale,
+                                 'on' if router_use_distance else 'off',
                              ))
         else:
             self.proj = NonLinear(self.sent_dim, 2)
@@ -83,7 +94,7 @@ class AttGRUModel(nn.Module):
         self.word_embed.weight.data.copy_(torch.from_numpy(pretrained_embedding))
         self.word_embed.weight.requires_grad = False
 
-    def forward(self, inputs):
+    def encode_representation(self, inputs):
         words, masks, word_len = inputs
         embed = self.word_embed(words)
         if self.training:
@@ -100,6 +111,10 @@ class AttGRUModel(nn.Module):
         # represents = hiddens
         represents = represents.sum(dim=1)
         # represents = represents[:, -1, :]
+        return represents
+
+    def forward(self, inputs):
+        represents = self.encode_representation(inputs)
         outputs = self.proj(represents)
         return outputs  # , represents
 
@@ -113,6 +128,26 @@ class AttGRUModel(nn.Module):
             return self.proj.get_metrics()
         return {}
 
+    def get_prototype_loss(self, targets, anomaly_id, batch_slice=None, normal_only=False):
+        if self.use_moe and hasattr(self.proj, 'get_prototype_loss'):
+            return self.proj.get_prototype_loss(
+                targets,
+                anomaly_id,
+                batch_slice=batch_slice,
+                normal_only=normal_only,
+            )
+        return self.atten_guide.new_zeros(())
+
+    def get_prototype_separation_loss(self):
+        if self.use_moe and hasattr(self.proj, 'get_prototype_separation_loss'):
+            return self.proj.get_prototype_separation_loss()
+        return self.atten_guide.new_zeros(())
+
+    def get_prototype_metrics(self):
+        if self.use_moe and hasattr(self.proj, 'get_prototype_metrics'):
+            return self.proj.get_prototype_metrics()
+        return {}
+
     def backbone_parameters(self):
         params = list(self.word_embed.parameters())
         params.extend(self.rnn.parameters())
@@ -124,6 +159,7 @@ class AttGRUModel(nn.Module):
         if not self.use_moe:
             return list(self.proj.parameters())
         params = list(self.proj.input_norm.parameters())
+        params.extend(self.proj.router_feature_norm.parameters())
         params.extend(self.proj.router.parameters())
         return params
 
@@ -133,4 +169,6 @@ class AttGRUModel(nn.Module):
         params = list(self.proj.down_projs.parameters())
         params.extend(self.proj.up_projs.parameters())
         params.extend(self.proj.heads.parameters())
+        if getattr(self.proj, 'prototype_bank', None) is not None:
+            params.extend(self.proj.prototype_bank.parameters())
         return params

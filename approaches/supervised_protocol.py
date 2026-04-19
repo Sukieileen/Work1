@@ -543,7 +543,10 @@ class MetaLog:
     def __init__(self, vocab, num_layer, hidden_size, label2id, backbone='gru', dropout=0.0, mamba_state=64,
                  mamba_conv=4, mamba_expand=2, mamba_variant='auto', use_moe=False, moe_num_experts=4,
                  moe_top_k=2, moe_bottleneck_dim=None, moe_temperature=1.5, moe_gate_dropout=0.1,
-                 moe_balance_loss_weight=1e-2, moe_diversity_loss_weight=1e-3, moe_z_loss_weight=0.0):
+                 moe_balance_loss_weight=1e-2, moe_diversity_loss_weight=1e-3, moe_z_loss_weight=0.0,
+                 use_normality_anchor=True, prototype_scale=1.0, prototype_loss_weight=0.1,
+                 prototype_sep_weight=1e-3, prototype_margin_global=1.0, prototype_margin_expert=1.0,
+                 prototype_target_normal_only=True, router_use_distance=True):
         self.label2id = label2id
         self.vocab = vocab
         self.num_layer = num_layer
@@ -563,6 +566,14 @@ class MetaLog:
         self.moe_balance_loss_weight = moe_balance_loss_weight
         self.moe_diversity_loss_weight = moe_diversity_loss_weight
         self.moe_z_loss_weight = moe_z_loss_weight
+        self.use_normality_anchor = use_normality_anchor
+        self.prototype_scale = prototype_scale
+        self.prototype_loss_weight = prototype_loss_weight
+        self.prototype_sep_weight = prototype_sep_weight
+        self.prototype_margin_global = prototype_margin_global
+        self.prototype_margin_expert = prototype_margin_expert
+        self.prototype_target_normal_only = prototype_target_normal_only
+        self.router_use_distance = router_use_distance
         self.model = self._build_model()
         if torch.cuda.is_available():
             self.model = self.model.cuda(device)
@@ -585,6 +596,11 @@ class MetaLog:
                 moe_balance_loss_weight=self.moe_balance_loss_weight,
                 moe_diversity_loss_weight=self.moe_diversity_loss_weight,
                 moe_z_loss_weight=self.moe_z_loss_weight,
+                use_normality_anchor=self.use_normality_anchor,
+                prototype_scale=self.prototype_scale,
+                prototype_margin_global=self.prototype_margin_global,
+                prototype_margin_expert=self.prototype_margin_expert,
+                router_use_distance=self.router_use_distance,
             )
         if self.backbone == 'bimamba':
             return AttBiMambaModel(
@@ -605,6 +621,11 @@ class MetaLog:
                 moe_balance_loss_weight=self.moe_balance_loss_weight,
                 moe_diversity_loss_weight=self.moe_diversity_loss_weight,
                 moe_z_loss_weight=self.moe_z_loss_weight,
+                use_normality_anchor=self.use_normality_anchor,
+                prototype_scale=self.prototype_scale,
+                prototype_margin_global=self.prototype_margin_global,
+                prototype_margin_expert=self.prototype_margin_expert,
+                router_use_distance=self.router_use_distance,
             )
         raise ValueError('Unsupported backbone: %s' % self.backbone)
 
@@ -623,24 +644,58 @@ class MetaLog:
             return self.model.get_auxiliary_loss()
         return logits.new_zeros(())
 
+    def _prototype_loss(self, labels, batch_slice=None, normal_only=False):
+        if hasattr(self.model, 'get_prototype_loss'):
+            loss = self.model.get_prototype_loss(
+                labels,
+                self.label2id['Anomalous'],
+                batch_slice=batch_slice,
+                normal_only=normal_only,
+            )
+            return loss, self._prototype_metrics()
+        return labels.float().new_zeros(()), {}
+
+    def _prototype_separation_loss(self):
+        if hasattr(self.model, 'get_prototype_separation_loss'):
+            return self.model.get_prototype_separation_loss()
+        return torch.zeros((), device=device)
+
+    def _prototype_metrics(self):
+        if hasattr(self.model, 'get_prototype_metrics'):
+            return self._scalarize_metrics(self.model.get_prototype_metrics())
+        return {}
+
     def classification_loss(self, logits, targets):
         tag_probs = sanitize_probs(logits)
         return self.loss(tag_probs, targets)
 
-    def compute_single_batch_loss(self, batch_insts):
+    def compute_single_batch_loss(self, batch_insts, normal_only_prototype=False):
         tinst = build_training_tinsts(batch_insts, self.vocab)
         move_tinst_to_runtime_device(tinst)
         logits = self.model(tinst.inputs)
         cls_loss = self.classification_loss(logits, tinst.targets)
         aux_loss = self._auxiliary_loss(logits)
-        total_loss = cls_loss + aux_loss
+        proto_loss, proto_metrics = self._prototype_loss(
+            tinst.truth,
+            normal_only=normal_only_prototype,
+        )
+        proto_sep_loss = self._prototype_separation_loss()
+        total_loss = (
+            cls_loss +
+            aux_loss +
+            self.prototype_loss_weight * proto_loss +
+            self.prototype_sep_weight * proto_sep_loss
+        )
         metrics = {
             'cls_loss': float(cls_loss.detach().cpu().item()),
             'aux_loss': float(aux_loss.detach().cpu().item()),
+            'proto_loss': float(proto_loss.detach().cpu().item()),
+            'proto_sep_loss': float(proto_sep_loss.detach().cpu().item()),
             'total_loss': float(total_loss.detach().cpu().item()),
         }
         if hasattr(self.model, 'get_moe_metrics'):
             metrics.update(self._scalarize_metrics(self.model.get_moe_metrics()))
+        metrics.update(proto_metrics)
         self.last_metrics = metrics
         return total_loss, metrics
 
@@ -653,20 +708,44 @@ class MetaLog:
         target_logits = logits[source_batch_size:]
         source_targets = tinst.targets[:source_batch_size]
         target_targets = tinst.targets[source_batch_size:]
+        source_labels = tinst.truth[:source_batch_size]
+        target_labels = tinst.truth[source_batch_size:]
 
         source_loss = self.classification_loss(source_logits, source_targets)
         target_loss = self.classification_loss(target_logits, target_targets)
         aux_loss = self._auxiliary_loss(logits)
-        total_loss = source_loss + target_weight * target_loss + aux_loss
+        source_proto_loss, source_proto_metrics = self._prototype_loss(
+            source_labels,
+            batch_slice=slice(0, source_batch_size),
+            normal_only=False,
+        )
+        target_proto_loss, target_proto_metrics = self._prototype_loss(
+            target_labels,
+            batch_slice=slice(source_batch_size, None),
+            normal_only=self.prototype_target_normal_only,
+        )
+        proto_sep_loss = self._prototype_separation_loss()
+        total_loss = (
+            source_loss +
+            target_weight * target_loss +
+            aux_loss +
+            self.prototype_loss_weight * (source_proto_loss + target_proto_loss) +
+            self.prototype_sep_weight * proto_sep_loss
+        )
 
         metrics = {
             'source_cls_loss': float(source_loss.detach().cpu().item()),
             'target_cls_loss': float(target_loss.detach().cpu().item()),
             'aux_loss': float(aux_loss.detach().cpu().item()),
+            'source_proto_loss': float(source_proto_loss.detach().cpu().item()),
+            'target_proto_loss': float(target_proto_loss.detach().cpu().item()),
+            'proto_sep_loss': float(proto_sep_loss.detach().cpu().item()),
             'total_loss': float(total_loss.detach().cpu().item()),
         }
         if hasattr(self.model, 'get_moe_metrics'):
             metrics.update(self._scalarize_metrics(self.model.get_moe_metrics()))
+        metrics.update({'source_' + key: value for key, value in source_proto_metrics.items()})
+        metrics.update({'target_' + key: value for key, value in target_proto_metrics.items()})
         self.last_metrics = metrics
         return total_loss, metrics
 
@@ -1092,7 +1171,23 @@ def run_warmup(context, args, checkpoint_prefix, select_by='loss'):
         mamba_conv=args.mamba_conv,
         mamba_expand=args.mamba_expand,
         mamba_variant=args.mamba_variant,
-        use_moe=False,
+        use_moe=args.use_normality_anchor,
+        moe_num_experts=args.moe_num_experts,
+        moe_top_k=args.moe_top_k,
+        moe_bottleneck_dim=args.moe_bottleneck_dim,
+        moe_temperature=args.moe_temperature,
+        moe_gate_dropout=args.moe_gate_dropout,
+        moe_balance_loss_weight=args.moe_balance_loss_weight,
+        moe_diversity_loss_weight=args.moe_diversity_loss_weight,
+        moe_z_loss_weight=args.moe_z_loss_weight,
+        use_normality_anchor=args.use_normality_anchor,
+        prototype_scale=args.prototype_scale,
+        prototype_loss_weight=args.prototype_loss_weight,
+        prototype_sep_weight=args.prototype_sep_weight,
+        prototype_margin_global=args.prototype_margin_global,
+        prototype_margin_expert=args.prototype_margin_expert,
+        prototype_target_normal_only=args.prototype_target_normal_only,
+        router_use_distance=args.router_use_distance,
     )
     optimizer = build_warmup_optimizer(metalog, args)
     best_value = None
@@ -1105,7 +1200,7 @@ def run_warmup(context, args, checkpoint_prefix, select_by='loss'):
         epoch_rng = np.random.RandomState(seed + epoch)
         for batch in iterate_batches(context['source_train'], args.source_batch_size, epoch_rng, shuffle=True):
             optimizer.zero_grad()
-            loss, metrics = metalog.compute_single_batch_loss(batch)
+            loss, metrics = metalog.compute_single_batch_loss(batch, normal_only_prototype=False)
             loss.backward()
             optimizer.step()
             epoch_losses.append(metrics['total_loss'])
@@ -1166,6 +1261,14 @@ def run_joint_finetune(context, args, checkpoint_prefix, warmup_checkpoint):
         moe_balance_loss_weight=args.moe_balance_loss_weight,
         moe_diversity_loss_weight=args.moe_diversity_loss_weight,
         moe_z_loss_weight=args.moe_z_loss_weight,
+        use_normality_anchor=args.use_normality_anchor,
+        prototype_scale=args.prototype_scale,
+        prototype_loss_weight=args.prototype_loss_weight,
+        prototype_sep_weight=args.prototype_sep_weight,
+        prototype_margin_global=args.prototype_margin_global,
+        prototype_margin_expert=args.prototype_margin_expert,
+        prototype_target_normal_only=args.prototype_target_normal_only,
+        router_use_distance=args.router_use_distance,
     )
     partial_load_state_dict(metalog.model, warmup_checkpoint, metalog.logger)
     optimizer = build_joint_optimizer(metalog, args)
@@ -1244,6 +1347,14 @@ def run_calibration(context, args, checkpoint_prefix, joint_checkpoint):
         moe_balance_loss_weight=args.calibration_balance_loss_weight,
         moe_diversity_loss_weight=args.calibration_diversity_loss_weight,
         moe_z_loss_weight=args.moe_z_loss_weight,
+        use_normality_anchor=args.use_normality_anchor,
+        prototype_scale=args.prototype_scale,
+        prototype_loss_weight=args.prototype_loss_weight,
+        prototype_sep_weight=args.prototype_sep_weight,
+        prototype_margin_global=args.prototype_margin_global,
+        prototype_margin_expert=args.prototype_margin_expert,
+        prototype_target_normal_only=args.prototype_target_normal_only,
+        router_use_distance=args.router_use_distance,
     )
     metalog.load_model_state(joint_checkpoint)
     set_parameter_trainability(metalog.model.backbone_parameters(), False)
@@ -1267,7 +1378,10 @@ def run_calibration(context, args, checkpoint_prefix, joint_checkpoint):
         for _ in range(steps_per_epoch):
             target_batch = target_sampler.sample(args.target_batch_size)
             optimizer.zero_grad()
-            loss, metrics = metalog.compute_single_batch_loss(target_batch)
+            loss, metrics = metalog.compute_single_batch_loss(
+                target_batch,
+                normal_only_prototype=args.prototype_target_normal_only,
+            )
             loss.backward()
             optimizer.step()
             epoch_metrics.append(metrics)
@@ -1323,6 +1437,14 @@ def final_evaluate(context, args, checkpoint_path, threshold, use_moe=True):
         moe_balance_loss_weight=args.calibration_balance_loss_weight,
         moe_diversity_loss_weight=args.calibration_diversity_loss_weight,
         moe_z_loss_weight=args.moe_z_loss_weight,
+        use_normality_anchor=args.use_normality_anchor,
+        prototype_scale=args.prototype_scale,
+        prototype_loss_weight=args.prototype_loss_weight,
+        prototype_sep_weight=args.prototype_sep_weight,
+        prototype_margin_global=args.prototype_margin_global,
+        prototype_margin_expert=args.prototype_margin_expert,
+        prototype_target_normal_only=args.prototype_target_normal_only,
+        router_use_distance=args.router_use_distance,
     )
     metalog.load_model_state(checkpoint_path)
     metrics = metalog.evaluate_metrics(context['target_test'], threshold=threshold, vocab=context['vocab'])
@@ -1342,7 +1464,7 @@ def final_evaluate(context, args, checkpoint_path, threshold, use_moe=True):
 
 def default_run_name(args, direction_name):
     return (
-        '%s_parser=%s_protocol=%s_backbone=%s_hidden=%d_moe=e%d_k%d'
+        '%s_parser=%s_protocol=%s_backbone=%s_hidden=%d_moe=e%d_k%d_na=%d'
         % (
             direction_name,
             args.parser,
@@ -1351,6 +1473,7 @@ def default_run_name(args, direction_name):
             lstm_hiddens,
             args.moe_num_experts,
             min(args.moe_top_k, args.moe_num_experts),
+            1 if args.use_normality_anchor else 0,
         )
     )
 
@@ -1432,6 +1555,34 @@ def build_arg_parser():
                         help='Phase C MoE diversity loss weight.')
     parser.add_argument('--moe_z_loss_weight', type=float, default=0.0,
                         help='Optional router z-loss weight.')
+    parser.add_argument('--use-normality-anchor', dest='use_normality_anchor', action='store_true',
+                        help='Enable normality-anchored drift-aware MoE head.')
+    parser.add_argument('--no-use-normality-anchor', dest='use_normality_anchor', action='store_false',
+                        help='Disable the prototype-anchored MoE enhancements.')
+    parser.add_argument('--prototype-scale', type=float, default=1.0,
+                        help='Scale applied to prototype-induced anomaly logits.')
+    parser.add_argument('--prototype-loss-weight', type=float, default=0.1,
+                        help='Weight applied to pull/push prototype losses.')
+    parser.add_argument('--prototype-sep-weight', type=float, default=1e-3,
+                        help='Weight applied to expert prototype separation regularization.')
+    parser.add_argument('--prototype-margin-global', type=float, default=1.0,
+                        help='Margin used to push anomalies away from the global prototype.')
+    parser.add_argument('--prototype-margin-expert', type=float, default=1.0,
+                        help='Margin used to push anomalies away from expert prototypes.')
+    parser.add_argument('--prototype-target-normal-only', dest='prototype_target_normal_only', action='store_true',
+                        help='Only apply target-domain prototype pull loss to target normals.')
+    parser.add_argument('--no-prototype-target-normal-only', dest='prototype_target_normal_only',
+                        action='store_false',
+                        help='Apply target-domain prototype loss to both target normals and anomalies.')
+    parser.add_argument('--router-use-distance', dest='router_use_distance', action='store_true',
+                        help='Use prototype distance and feature norm in router inputs.')
+    parser.add_argument('--no-router-use-distance', dest='router_use_distance', action='store_false',
+                        help='Disable distance-aware router features.')
+    parser.set_defaults(
+        use_normality_anchor=True,
+        prototype_target_normal_only=True,
+        router_use_distance=True,
+    )
     return parser
 
 
@@ -1528,7 +1679,7 @@ def run_direction(direction_key, args):
         if not checkpoint_path:
             raise ValueError('mode=test requires --checkpoint.')
         threshold = args.threshold
-        use_moe = context['uses_target_training']
+        use_moe = context['uses_target_training'] or args.use_normality_anchor
         if args.auto_threshold and not context['force_fixed_threshold']:
             evaluator = MetaLog(
                 context['vocab'],
@@ -1544,12 +1695,20 @@ def run_direction(direction_key, args):
                 use_moe=use_moe,
                 moe_num_experts=args.moe_num_experts,
                 moe_top_k=args.moe_top_k,
-                moe_bottleneck_dim=args.moe_bottleneck_dim if args.moe_bottleneck_dim > 0 else None,
+                moe_bottleneck_dim=args.moe_bottleneck_dim,
                 moe_temperature=args.moe_temperature,
                 moe_gate_dropout=args.moe_gate_dropout,
                 moe_balance_loss_weight=args.calibration_balance_loss_weight,
                 moe_diversity_loss_weight=args.calibration_diversity_loss_weight,
                 moe_z_loss_weight=args.moe_z_loss_weight,
+                use_normality_anchor=args.use_normality_anchor,
+                prototype_scale=args.prototype_scale,
+                prototype_loss_weight=args.prototype_loss_weight,
+                prototype_sep_weight=args.prototype_sep_weight,
+                prototype_margin_global=args.prototype_margin_global,
+                prototype_margin_expert=args.prototype_margin_expert,
+                prototype_target_normal_only=args.prototype_target_normal_only,
+                router_use_distance=args.router_use_distance,
             )
             evaluator.load_model_state(checkpoint_path)
             threshold, _ = evaluator.tune_threshold(
@@ -1578,7 +1737,23 @@ def run_direction(direction_key, args):
                 mamba_conv=args.mamba_conv,
                 mamba_expand=args.mamba_expand,
                 mamba_variant=args.mamba_variant,
-                use_moe=False,
+                use_moe=args.use_normality_anchor,
+                moe_num_experts=args.moe_num_experts,
+                moe_top_k=args.moe_top_k,
+                moe_bottleneck_dim=args.moe_bottleneck_dim,
+                moe_temperature=args.moe_temperature,
+                moe_gate_dropout=args.moe_gate_dropout,
+                moe_balance_loss_weight=args.moe_balance_loss_weight,
+                moe_diversity_loss_weight=args.moe_diversity_loss_weight,
+                moe_z_loss_weight=args.moe_z_loss_weight,
+                use_normality_anchor=args.use_normality_anchor,
+                prototype_scale=args.prototype_scale,
+                prototype_loss_weight=args.prototype_loss_weight,
+                prototype_sep_weight=args.prototype_sep_weight,
+                prototype_margin_global=args.prototype_margin_global,
+                prototype_margin_expert=args.prototype_margin_expert,
+                prototype_target_normal_only=args.prototype_target_normal_only,
+                router_use_distance=args.router_use_distance,
             )
             evaluator.load_model_state(warmup_checkpoint)
             threshold, _ = evaluator.tune_threshold(
@@ -1589,7 +1764,7 @@ def run_direction(direction_key, args):
                 threshold_step=args.threshold_step,
                 split_name=context['selection_split_name'],
             )
-        final_evaluate(context, args, warmup_checkpoint, threshold, use_moe=False)
+        final_evaluate(context, args, warmup_checkpoint, threshold, use_moe=args.use_normality_anchor)
         return
 
     _, _, joint_last_checkpoint = run_joint_finetune(context, args, checkpoint_prefix, warmup_checkpoint)
