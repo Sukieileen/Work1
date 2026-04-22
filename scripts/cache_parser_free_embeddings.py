@@ -14,7 +14,7 @@ def identity_cut(instances):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--dataset', type=str, required=True, choices=['HDFS', 'BGL', 'BGLSample', 'OpenStack'],
+    parser.add_argument('--dataset', type=str, required=True, choices=['HDFS', 'BGL', 'BGLSample'],
                         help='Dataset to preprocess with the parser-free pipeline.')
     parser.add_argument('--plm_model', type=str, default='bert-base-uncased',
                         help='Hugging Face model name used by parser-free encoding.')

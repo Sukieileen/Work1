@@ -238,11 +238,10 @@ def write_search_plan(plan_file, configs, stage_name, train_epochs):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--parser', type=str, default='parser_free', choices=['parser_free', 'IBM'],
+    parser.add_argument('--parser', type=str, default='parser_free', choices=['parser_free'],
                         help='Input pipeline used by MetaLog.py during search.')
     parser.add_argument('--protocol', type=str, default='clean',
-                        choices=['clean', 'clean_1pct_anomaly_only', 'metalog_repo_sample', 'metalog_repo_pseudo',
-                                 'metalog_repo_full', 'zero_shot'],
+                        choices=['clean'],
                         help='Data split protocol used during search.')
     parser.add_argument('--plm_model', type=str, default='bert-base-uncased',
                         help='Hugging Face model name used when parser=parser_free.')

@@ -2,14 +2,7 @@ import sys
 
 sys.path.extend([".", ".."])
 from CONSTANTS import *
-from parsers.Drain_IBM import Drain3Parser
 import abc
-
-
-def _async_parsing(parser, lines, log2temp):
-    for id, line in lines:
-        cluster = parser.match(line)
-        log2temp[id] = cluster.cluster_id
 
 
 class BasicDataLoader():
@@ -43,91 +36,6 @@ class BasicDataLoader():
     @abc.abstractmethod
     def _pre_process(self, line):
         return
-
-    def parse_by_IBM(self, config_file, persistence_folder, core_jobs=5):
-        '''
-        Load parsing results by IDM Drain
-        :param config_file: IDM Drain configuration file.
-        :param persistence_folder: IDM Drain persistence file.
-        :return: Update templates, log2temp attributes in self.
-        '''
-        self._restore()
-        if not os.path.exists(config_file):
-            self.logger.error('IBM Drain config file %s not found.' % config_file)
-            exit(1)
-        parser = Drain3Parser(config_file=config_file, persistence_folder=persistence_folder)
-        persistence_folder = parser.persistence_folder
-
-        # Specify persistence files.
-        log_event_seq_file = os.path.join(persistence_folder, 'log_sequences.txt')
-        log_template_mapping_file = os.path.join(persistence_folder, 'log_event_mapping.dict')
-        templates_embedding_file = os.path.join(parser.persistence_folder, 'templates.vec')
-        start_time = time.time()
-        if parser.to_update:
-            if hasattr(self, 'ab_in_file'):
-                self.logger.info('No trained parser found, start training.')
-                parser.parse_file_os(self.in_file, self.ab_in_file, remove_cols=self.remove_cols)
-                self.logger.info('Get total %d templates.' % len(parser.parser.drain.clusters))
-            else:
-                self.logger.info('No trained parser found, start training.')
-                parser.parse_file(self.in_file, remove_cols=self.remove_cols)
-                self.logger.info('Get total %d templates.' % len(parser.parser.drain.clusters))
-
-        # Load templates from trained parser.
-        for cluster_inst in parser.parser.drain.clusters:
-            self.templates[int(cluster_inst.cluster_id)] = cluster_inst.get_template()
-
-        # check parsing resutls such as log2event dict and template embeddings.
-        if self._check_parsing_persistences(log_template_mapping_file, log_event_seq_file):
-            self.load_parsing_results(log_template_mapping_file, log_event_seq_file)
-            pass
-        else:
-            # parsing results not found, or somehow missing.
-            self.logger.info('Missing persistence file(s), start with a full parsing process.')
-            self.logger.warning(
-                'If you don\'t want this to happen, please copy persistence files from somewhere else and put it in %s' % persistence_folder)
-            ori_lines = []
-            with open(self.in_file, 'r', encoding='utf-8') as reader:
-                log_id = 0
-                for line in tqdm(reader.readlines()):
-                    processed_line = self._pre_process(line)
-                    ori_lines.append((log_id, processed_line))
-                    log_id += 1
-            if hasattr(self, 'ab_in_file'):
-                with open(self.ab_in_file, 'r', encoding='utf-8') as reader:
-                    for line in tqdm(reader.readlines()):
-                        processed_line = self._pre_process(line)
-                        ori_lines.append((log_id, processed_line))
-                        log_id += 1
-            self.logger.info('Parsing raw log....')
-            if core_jobs:
-                m = Manager()
-                log2temp = m.dict()
-                pool = Pool(core_jobs)
-                splitted_lines = self._split(ori_lines, core_jobs)
-                inputs = zip([parser] * core_jobs, splitted_lines, [log2temp] * core_jobs)
-                pool.starmap(_async_parsing, inputs)
-                pool.close()
-                pool.join()
-                self.log2temp = dict(log2temp)
-                pass
-            else:
-                for item in ori_lines:
-                    self._sync_parsing(parser, item)
-
-            self.logger.info('Finished parsing in %.2f' % (time.time() - start_time))
-
-            # Transform original log sequences with log ids(line number) to log event sequence.
-            for block, seq in self.block2seqs.items():
-                self.block2eventseq[block] = []
-                for log_id in seq:
-                    self.block2eventseq[block].append(self.log2temp[log_id])
-
-            # Record block id and log event sequences.
-            self._record_parsing_results(log_template_mapping_file, log_event_seq_file)
-        # Prepare semantic embeddings.
-        self._prepare_semantic_embed(templates_embedding_file)
-        self.logger.info('All data preparation finished in %.2f' % (time.time() - start_time))
 
     def parse_by_parser_free(self, persistence_folder, normalizer):
         if not callable(normalizer):
@@ -234,7 +142,7 @@ class BasicDataLoader():
         return flag
 
     def _record_parsing_results(self, log_template_mapping_file, evet_seq_file):
-        # Recording IBM parsing result.
+        # Recording parsing results.
         start_time = time.time()
         log_template_mapping_writer = open(log_template_mapping_file, 'w', encoding='utf-8')
         event_seq_writer = open(evet_seq_file, 'w', encoding='utf-8')
@@ -275,18 +183,6 @@ class BasicDataLoader():
             embed = np.asarray(token[1:], dtype=np.float)
             self.id2embed[template_id] = embed
         self.logger.info('Load %d templates with embedding size %d' % (len(self.id2embed), self.id2embed[1].shape[0]))
-
-    def _split(self, X, copies=5):
-        quota = int(len(X) / copies) + 1
-        res = []
-        for i in range(copies):
-            res.append(X[i * quota:(i + 1) * quota])
-        return res
-
-    def _sync_parsing(self, parser, line):
-        (id, message) = line
-        cluster = parser.match(message)
-        self.log2temp[id] = cluster.cluster_id
 
     def _iter_raw_log_files(self):
         files = [self.in_file]

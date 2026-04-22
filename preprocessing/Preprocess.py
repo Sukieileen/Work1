@@ -2,7 +2,6 @@ from CONSTANTS import *
 from entities.instances import Instance
 from preprocessing.dataloader.BGLLoader import BGLLoader
 from preprocessing.dataloader.HDFSLoader import HDFSLoader
-from preprocessing.dataloader.OSLoader import OSLoader
 
 
 class Preprocessor:
@@ -48,9 +47,8 @@ class Preprocessor:
     def process(self, dataset, parsing, template_encoding, cut_func):
         '''
         Preprocess approach, log loading, parsing and cutting.
-        Please be noted that if you want to add more datasets or parsers, you should modify here.
         :param dataset: Specified dataset
-        :param parsing: Specified log parser, IBM(Drain) now supported.
+        :param parsing: Specified log parsing pipeline.
         :param template_encoding: Semantic representation functio for log templates.
         :param cut_func: Curtting function for all instances.
         :return: Train, Dev and Test data in list of instances.
@@ -60,40 +58,31 @@ class Preprocessor:
         self.dataset = dataset
         self.parsing = parsing
         dataloader = None
-        parser_config = None
         parser_persistence = os.path.join(PROJECT_ROOT, 'datasets/' + dataset + '/persistences')
         semantic_repr_func = template_encoding.present if hasattr(template_encoding, 'present') else template_encoding
 
         if dataset == 'HDFS':
             dataloader = HDFSLoader(in_file=os.path.join(PROJECT_ROOT, 'datasets/HDFS/HDFS.log'),
                                     semantic_repr_func=semantic_repr_func)
-            parser_config = os.path.join(PROJECT_ROOT, 'conf/HDFS.ini')
         elif dataset == 'BGL' or dataset == 'BGLSample':
             in_file = os.path.join(PROJECT_ROOT, 'datasets/' + dataset + '/' + dataset + '.log')
             dataset_base = os.path.join(PROJECT_ROOT, 'datasets/' + dataset)
             dataloader = BGLLoader(in_file=in_file, dataset_base=dataset_base,
                                    semantic_repr_func=semantic_repr_func)
-            parser_config = os.path.join(PROJECT_ROOT, 'conf/BGL.ini')
-        elif dataset == 'OpenStack':
-            dataloader = OSLoader(in_file=os.path.join(PROJECT_ROOT, 'datasets/OpenStack/openstack_normal1.log'),
-                                    ab_in_file=os.path.join(PROJECT_ROOT, 'datasets/OpenStack/openstack_abnormal.log'),
-                                    semantic_repr_func=semantic_repr_func)
-            parser_config = os.path.join(PROJECT_ROOT, 'conf/OpenStack.ini')
+        else:
+            raise ValueError('Unsupported dataset: %s. Only HDFS/BGL main-pipeline datasets are kept.' % dataset)
 
         self.dataloader = dataloader
 
-        if parsing == 'IBM':
-            self.dataloader.parse_by_IBM(config_file=parser_config, persistence_folder=parser_persistence)
-        elif parsing == 'parser_free':
-            persistence_suffix = getattr(template_encoding, 'persistence_suffix', 'default')
-            parser_persistence = os.path.join(parser_persistence, 'parser_free', persistence_suffix)
-            self.dataloader.parse_by_parser_free(
-                persistence_folder=parser_persistence,
-                normalizer=template_encoding.normalize,
-            )
-        else:
+        if parsing != 'parser_free':
             self.logger.error('Parsing method %s not implemented yet.')
             raise NotImplementedError
+        persistence_suffix = getattr(template_encoding, 'persistence_suffix', 'default')
+        parser_persistence = os.path.join(parser_persistence, 'parser_free', persistence_suffix)
+        self.dataloader.parse_by_parser_free(
+            persistence_folder=parser_persistence,
+            normalizer=template_encoding.normalize,
+        )
         return self._gen_instances(cut_func=cut_func)
 
 

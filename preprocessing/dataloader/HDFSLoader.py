@@ -1,10 +1,9 @@
 import sys
 
 sys.path.extend([".", ".."])
+from CONSTANTS import *
 from preprocessing.BasicLoader import BasicDataLoader
 import os.path
-
-from parsers.Drain_IBM import *
 
 
 class HDFSLoader(BasicDataLoader):
@@ -43,98 +42,6 @@ class HDFSLoader(BasicDataLoader):
         self._load_hdfs_labels()
         self.semantic_repr_func = semantic_repr_func
         pass
-
-    def parse_by_Official(self):
-        self._restore()
-        templates = [
-            "Adding an already existing block (.*)",
-            "(.*)Verification succeeded for (.*)",
-            "(.*) Served block (.*) to (.*)",
-            "(.*):Got exception while serving (.*) to (.*):(.*)",
-            "Receiving block (.*) src: (.*) dest: (.*)",
-            "Received block (.*) src: (.*) dest: (.*) of size ([-]?[0-9]+)",
-            "writeBlock (.*) received exception (.*)",
-            "PacketResponder ([-]?[0-9]+) for block (.*) Interrupted\.",
-            "Received block (.*) of size ([-]?[0-9]+) from (.*)",
-            "PacketResponder (.*) ([-]?[0-9]+) Exception (.*)",
-            "PacketResponder ([-]?[0-9]+) for block (.*) terminating",
-            "(.*):Exception writing block (.*) to mirror (.*)(.*)",
-            "Receiving empty packet for block (.*)",
-            "Exception in receiveBlock for block (.*) (.*)",
-            "Changing block file offset of block (.*) from ([-]?[0-9]+) to ([-]?[0-9]+) meta file offset to ([-]?[0-9]+)",
-            "(.*):Transmitted block (.*) to (.*)",
-            "(.*):Failed to transfer (.*) to (.*) got (.*)",
-            "(.*) Starting thread to transfer block (.*) to (.*)",
-            "Reopen Block (.*)",
-            "Unexpected error trying to delete block (.*)\. BlockInfo not found in volumeMap\.",
-            "Deleting block (.*) file (.*)",
-            "BLOCK\* NameSystem\.allocateBlock: (.*)\. (.*)",
-            "BLOCK\* NameSystem\.delete: (.*) is added to invalidSet of (.*)",
-            "BLOCK\* Removing block (.*) from neededReplications as it does not belong to any file\.",
-            "BLOCK\* ask (.*) to replicate (.*) to (.*)",
-            "BLOCK\* NameSystem\.addStoredBlock: blockMap updated: (.*) is added to (.*) size ([-]?[0-9]+)",
-            "BLOCK\* NameSystem\.addStoredBlock: Redundant addStoredBlock request received for (.*) on (.*) size ([-]?[0-9]+)",
-            "BLOCK\* NameSystem\.addStoredBlock: addStoredBlock request received for (.*) on (.*) size ([-]?[0-9]+) But it does not belong to any file\.",
-            "PendingReplicationMonitor timed out block (.*)"
-        ]
-        save_path = os.path.join(PROJECT_ROOT,
-                                 'datasets/HDFS/persistences/official')
-        if not os.path.exists(save_path):
-            os.makedirs(save_path)
-        templates_file = os.path.join(save_path, 'NC_templates.txt')
-        log2temp_file = os.path.join(save_path, 'log2temp.txt')
-        logseq_file = os.path.join(save_path, 'event_seqs.txt')
-        if os.path.exists(templates_file) and os.path.exists(log2temp_file) and os.path.exists(logseq_file):
-            self.logger.info('Found parsing result, please note that this does not guarantee a smooth execution.')
-            with open(templates_file, 'r', encoding='utf-8') as reader:
-                self._load_templates(reader)
-
-            with open(log2temp_file, 'r', encoding='utf-8') as reader:
-                self._load_log2temp(reader)
-
-            with open(logseq_file, 'r', encoding='utf-8') as reader:
-                self._load_log_event_seqs(reader)
-            pass
-        else:
-            self.logger.info('Parsing result not found, start a new one.')
-            for id, template in enumerate(templates):
-                self.templates[id] = template
-            with open(self.in_file, 'r', encoding='utf-8') as reader:
-                log_id = 0
-                for line in tqdm(reader.readlines()):
-                    line = line.strip()
-                    if self.remove_cols:
-                        processed_line = self._pre_process(line)
-                    for index, template in self.templates.items():
-                        if re.compile(template).match(processed_line) is not None:
-                            self.log2temp[log_id] = index
-                            break
-                    if log_id not in self.log2temp.keys():
-                        self.logger.warning(
-                            'Mismatched log message : %s, try using original line.' % processed_line)
-                        for index, template in self.templates.items():
-                            if re.compile(template).match(line) is not None:
-                                self.log2temp[log_id] = index
-                                break
-                        if log_id not in self.log2temp.keys():
-                            self.logger.error('Failed to parse line %s' % line)
-                            exit(2)
-                    log_id += 1
-
-            for block, seq in self.block2seqs.items():
-                self.block2eventseq[block] = []
-                for log_id in seq:
-                    self.block2eventseq[block].append(self.log2temp[log_id])
-
-            with open(templates_file, 'w', encoding='utf-8') as writer:
-                for id, template in self.templates.items():
-                    writer.write(','.join([str(id), template]) + '\n')
-            with open(log2temp_file, 'w', encoding='utf-8') as writer:
-                for logid, tempid in self.log2temp.items():
-                    writer.write(','.join([str(logid), str(tempid)]) + '\n')
-            with open(logseq_file, 'w', encoding='utf-8') as writer:
-                self._save_log_event_seqs(writer)
-        self._prepare_semantic_embed(os.path.join(save_path, 'event2semantic.vec'))
 
     def logger(self):
         return self.logger
@@ -199,16 +106,3 @@ class HDFSLoader(BasicDataLoader):
                 block = token[0]
                 label = self.id2label[int(token[1])]
                 self.block2label[block] = label
-
-
-if __name__ == '__main__':
-    from representations.templates.statistics import Simple_template_TF_IDF
-
-    semantic_encoder = Simple_template_TF_IDF()
-    loader = HDFSLoader(in_file=os.path.join(PROJECT_ROOT, 'datasets/temp_HDFS/HDFS.log'),
-                        datasets_base=os.path.join(PROJECT_ROOT, 'datasets/temp_HDFS'),
-                        semantic_repr_func=semantic_encoder.present)
-    loader.parse_by_IBM(config_file=os.path.join(PROJECT_ROOT, 'conf/HDFS.ini'),
-                        persistence_folder=os.path.join(PROJECT_ROOT, 'datasets/temp_HDFS/persistences'))
-
-    pass

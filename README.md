@@ -8,7 +8,7 @@
 ├─utils
 ├─logs        
 ├─datasets    
-├─models      # Attention-based GRU.
+├─models      # Main BiMamba/MoE detection modules.
 ├─module      # Anomaly detection modules, including classifier, Attention, etc.
 ├─outputs           
 ├─parsers     # Drain parser.
@@ -38,8 +38,6 @@ PyTorch v1.10.1
 
 python v3.8.3
 
-hdbscan v0.8.27
-
 overrides v6.1.0
 
 scikit-learn v0.24
@@ -47,8 +45,6 @@ scikit-learn v0.24
 tqdm
 
 regex
-
-[Drain3](https://github.com/IBM/Drain3)
 
 ## Preparation
 
@@ -59,3 +55,5 @@ regex
 ## Run
 - Run `approaches/MetaLog.py` (make sure it has proper parameters) for bilateral generalization from HDFS to BGL.
 - Run `approaches/MetaLog_BH.py` (make sure it has proper parameters) for bilateral generalization from BGL to HDFS.
+
+The current main pipeline keeps the `parser_free + BiMamba (+ MoE / normality anchor)` path for HDFS/BGL.

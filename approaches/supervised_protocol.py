@@ -10,19 +10,10 @@ from dataclasses import dataclass
 from CONSTANTS import *
 from entities.TensorInstances import TInstWithLogits
 from entities.instances import Instance
-from models.gru import AttGRUModel
 from models.mamba import AttBiMambaModel
-from preprocessing.AutoLabeling import Probabilistic_Labeling
 from preprocessing.Preprocess import Preprocessor
 from representations.parser_free import ParserFreeEncoder
-from representations.sequences.statistics import Sequential_TF
-from representations.templates.statistics import Simple_template_TF_IDF, Template_TF_IDF_without_clean
 from utils.Vocab import Vocab
-
-try:
-    from sklearn.decomposition import FastICA
-except ImportError:
-    FastICA = None
 
 try:
     from sklearn.metrics import average_precision_score, roc_auc_score
@@ -73,26 +64,6 @@ CLEAN_DIRECTION_CONFIGS = {
     },
 }
 
-
-CLEAN_1PCT_ANOMALY_ONLY_DIRECTION_CONFIGS = {
-    'hdfs_to_bgl': {
-        'source_ratio': 0.3,
-        'target_normal_ratio': 0.0,
-        'target_anomaly_ratio': 0.01,
-    },
-    'bgl_to_hdfs': {
-        'source_ratio': 1.0,
-        'target_normal_ratio': 0.0,
-        'target_anomaly_ratio': 0.01,
-    },
-}
-
-PSEUDO_LABEL_DEFAULTS = {
-    'min_cluster_size': 100,
-    'min_samples': 100,
-    'reduce_dimension': 50,
-    'normal_fraction': 0.5,
-}
 
 PARSER_FREE_DEFAULTS = {
     'model_name': 'bert-base-uncased',
@@ -244,68 +215,6 @@ def split_instances_by_grouped_label_ratios(instances, normal_ratio, anomaly_rat
     return train_instances, test_instances
 
 
-def split_instances_by_ordered_prefix(instances, train_ratio, dev_ratio, rng):
-    if train_ratio < 0 or dev_ratio < 0 or train_ratio + dev_ratio > 1:
-        raise ValueError('train_ratio and dev_ratio must be non-negative and sum to at most 1.')
-    if train_ratio == 1.0 and dev_ratio == 0.0:
-        return list(instances), [], []
-
-    train_size = int(len(instances) * train_ratio)
-    dev_size = int(len(instances) * dev_ratio)
-    prefix_instances = list(instances[:train_size + dev_size])
-    rng.shuffle(prefix_instances)
-    train_instances = prefix_instances[:train_size]
-    dev_instances = prefix_instances[train_size:]
-    test_instances = list(instances[train_size + dev_size:])
-    return train_instances, dev_instances, test_instances
-
-
-def keep_target_train_anomalies_by_ratio(instances, keep_ratio, rng):
-    if keep_ratio >= 1:
-        return list(instances)
-    if keep_ratio < 0:
-        raise ValueError('keep_ratio must be non-negative.')
-
-    kept_instances = []
-    for inst in instances:
-        if inst.label == 'Anomalous' and rng.rand() > keep_ratio:
-            continue
-        kept_instances.append(inst)
-    return kept_instances
-
-
-def cut_all_metalog(instances, rng):
-    shuffled = list(instances)
-    rng.shuffle(shuffled)
-    return shuffled, [], []
-
-
-def cut_by_415_metalog(instances, rng):
-    return split_instances_by_ordered_prefix(instances, train_ratio=0.4, dev_ratio=0.1, rng=rng)
-
-
-def cut_by_316_filter_metalog(instances, rng):
-    train_instances, dev_instances, test_instances = split_instances_by_ordered_prefix(
-        instances,
-        train_ratio=0.3,
-        dev_ratio=0.1,
-        rng=rng,
-    )
-    train_instances = keep_target_train_anomalies_by_ratio(train_instances, keep_ratio=0.01, rng=rng)
-    return train_instances, dev_instances, test_instances
-
-
-def cut_by_253_filter_metalog(instances, rng):
-    train_instances, dev_instances, test_instances = split_instances_by_ordered_prefix(
-        instances,
-        train_ratio=0.2,
-        dev_ratio=0.5,
-        rng=rng,
-    )
-    train_instances = keep_target_train_anomalies_by_ratio(train_instances, keep_ratio=0.01, rng=rng)
-    return train_instances, dev_instances, test_instances
-
-
 def collect_event_ids(instances):
     event_ids = set()
     for inst in instances:
@@ -334,115 +243,6 @@ def label_summary(instances, use_training_labels=False):
 def split_has_both_labels(instances):
     labels = {inst.label for inst in instances}
     return 'Normal' in labels and 'Anomalous' in labels
-
-
-def compute_effective_label_metrics(instances):
-    TP, TN, FP, FN = 0, 0, 0, 0
-    for inst in instances:
-        predicted_label = get_effective_training_label(inst)
-        if predicted_label == 'Anomalous':
-            if inst.label == 'Anomalous':
-                TP += 1
-            else:
-                FP += 1
-        else:
-            if inst.label == 'Normal':
-                TN += 1
-            else:
-                FN += 1
-    precision = 100 * TP / (TP + FP) if TP + FP else 0.0
-    recall = 100 * TP / (TP + FN) if TP + FN else 0.0
-    f1 = 2 * precision * recall / (precision + recall) if precision + recall else 0.0
-    return {
-        'precision': precision,
-        'recall': recall,
-        'f1': f1,
-        'TP': TP,
-        'TN': TN,
-        'FP': FP,
-        'FN': FN,
-    }
-
-
-def format_float_for_path(value):
-    return ('%.3f' % value).replace('.', 'p')
-
-
-def build_pseudo_label_cache_paths(protocol, direction_key, target_dataset, parser_name, args):
-    reduce_dimension = get_protocol_option(args, 'pseudo_reduce_dimension', PSEUDO_LABEL_DEFAULTS['reduce_dimension'])
-    min_cluster_size = get_protocol_option(args, 'pseudo_min_cluster_size', PSEUDO_LABEL_DEFAULTS['min_cluster_size'])
-    min_samples = get_protocol_option(args, 'pseudo_min_samples', PSEUDO_LABEL_DEFAULTS['min_samples'])
-    normal_fraction = get_protocol_option(args, 'pseudo_normal_fraction', PSEUDO_LABEL_DEFAULTS['normal_fraction'])
-    cache_dir = os.path.join(
-        PROJECT_ROOT,
-        'outputs/results/supervised_protocol/pseudo_labels',
-        protocol,
-        '%s_%s_%s' % (direction_key, target_dataset, parser_name),
-        'rd=%s_mcs=%d_ms=%d_nf=%s' % (
-            str(reduce_dimension),
-            min_cluster_size,
-            min_samples,
-            format_float_for_path(normal_fraction),
-        ),
-    )
-    return (
-        os.path.join(cache_dir, 'label_res.txt'),
-        os.path.join(cache_dir, 'random_state.pkl'),
-    )
-
-
-def assign_instance_representations(instances, representations):
-    for index, inst in enumerate(instances):
-        inst.repr = representations[index]
-
-
-def build_pseudo_labeled_target_train(instances, processor, direction_key, parser_name, protocol, args):
-    if not instances:
-        return []
-
-    reduce_dimension = get_protocol_option(args, 'pseudo_reduce_dimension', PSEUDO_LABEL_DEFAULTS['reduce_dimension'])
-    min_cluster_size = get_protocol_option(args, 'pseudo_min_cluster_size', PSEUDO_LABEL_DEFAULTS['min_cluster_size'])
-    min_samples = get_protocol_option(args, 'pseudo_min_samples', PSEUDO_LABEL_DEFAULTS['min_samples'])
-    normal_fraction = get_protocol_option(args, 'pseudo_normal_fraction', PSEUDO_LABEL_DEFAULTS['normal_fraction'])
-
-    sequential_encoder = Sequential_TF(processor.embedding)
-    train_representations = sequential_encoder.present(instances)
-    assign_instance_representations(instances, train_representations)
-
-    if reduce_dimension != -1:
-        if FastICA is None:
-            raise ImportError('sklearn is required for pseudo labeling with dimensionality reduction.')
-        feature_dim = train_representations.shape[1] if train_representations.ndim > 1 else 1
-        n_components = min(reduce_dimension, len(instances), feature_dim)
-        if n_components <= 0:
-            raise ValueError('Pseudo labeling needs at least one target-train component.')
-        if n_components < feature_dim:
-            transformer = FastICA(n_components=n_components, random_state=seed)
-            reduced_representations = transformer.fit_transform(train_representations)
-            assign_instance_representations(instances, reduced_representations)
-
-    normal_indices = [index for index, inst in enumerate(instances) if inst.label == 'Normal']
-    if not normal_indices:
-        raise ValueError('Pseudo labeling requires at least one target-train normal instance.')
-    seed_normal_count = int(normal_fraction * len(normal_indices))
-    if seed_normal_count <= 0:
-        seed_normal_count = 1
-    normal_ids = normal_indices[:seed_normal_count]
-
-    label_res_file, random_state_file = build_pseudo_label_cache_paths(
-        protocol,
-        direction_key,
-        processor.dataset,
-        parser_name,
-        args,
-    )
-    label_generator = Probabilistic_Labeling(
-        min_samples=min_samples,
-        min_clust_size=min_cluster_size,
-        res_file=label_res_file,
-        rand_state_file=random_state_file,
-    )
-    return label_generator.auto_label(instances, normal_ids)
 
 
 def filter_trainable_parameters(parameters):
@@ -540,7 +340,7 @@ class MetaLog:
     def logger(self):
         return MetaLog._logger
 
-    def __init__(self, vocab, num_layer, hidden_size, label2id, backbone='gru', dropout=0.0, mamba_state=64,
+    def __init__(self, vocab, num_layer, hidden_size, label2id, backbone='bimamba', dropout=0.0, mamba_state=64,
                  mamba_conv=4, mamba_expand=2, mamba_variant='auto', use_moe=False, moe_num_experts=4,
                  moe_top_k=2, moe_bottleneck_dim=None, moe_temperature=1.5, moe_gate_dropout=0.1,
                  moe_balance_loss_weight=1e-2, moe_diversity_loss_weight=1e-3, moe_z_loss_weight=0.0,
@@ -581,53 +381,32 @@ class MetaLog:
         self.last_metrics = {}
 
     def _build_model(self):
-        if self.backbone == 'gru':
-            return AttGRUModel(
-                self.vocab,
-                self.num_layer,
-                self.hidden_size,
-                dropout=self.dropout,
-                use_moe=self.use_moe,
-                moe_num_experts=self.moe_num_experts,
-                moe_top_k=self.moe_top_k,
-                moe_bottleneck_dim=self.moe_bottleneck_dim,
-                moe_temperature=self.moe_temperature,
-                moe_gate_dropout=self.moe_gate_dropout,
-                moe_balance_loss_weight=self.moe_balance_loss_weight,
-                moe_diversity_loss_weight=self.moe_diversity_loss_weight,
-                moe_z_loss_weight=self.moe_z_loss_weight,
-                use_normality_anchor=self.use_normality_anchor,
-                prototype_scale=self.prototype_scale,
-                prototype_margin_global=self.prototype_margin_global,
-                prototype_margin_expert=self.prototype_margin_expert,
-                router_use_distance=self.router_use_distance,
-            )
-        if self.backbone == 'bimamba':
-            return AttBiMambaModel(
-                self.vocab,
-                self.num_layer,
-                self.hidden_size,
-                dropout=self.dropout,
-                mamba_state=self.mamba_state,
-                mamba_conv=self.mamba_conv,
-                mamba_expand=self.mamba_expand,
-                mamba_variant=self.mamba_variant,
-                use_moe=self.use_moe,
-                moe_num_experts=self.moe_num_experts,
-                moe_top_k=self.moe_top_k,
-                moe_bottleneck_dim=self.moe_bottleneck_dim,
-                moe_temperature=self.moe_temperature,
-                moe_gate_dropout=self.moe_gate_dropout,
-                moe_balance_loss_weight=self.moe_balance_loss_weight,
-                moe_diversity_loss_weight=self.moe_diversity_loss_weight,
-                moe_z_loss_weight=self.moe_z_loss_weight,
-                use_normality_anchor=self.use_normality_anchor,
-                prototype_scale=self.prototype_scale,
-                prototype_margin_global=self.prototype_margin_global,
-                prototype_margin_expert=self.prototype_margin_expert,
-                router_use_distance=self.router_use_distance,
-            )
-        raise ValueError('Unsupported backbone: %s' % self.backbone)
+        if self.backbone != 'bimamba':
+            raise ValueError('Unsupported backbone: %s. Only bimamba is kept in the main pipeline.' % self.backbone)
+        return AttBiMambaModel(
+            self.vocab,
+            self.num_layer,
+            self.hidden_size,
+            dropout=self.dropout,
+            mamba_state=self.mamba_state,
+            mamba_conv=self.mamba_conv,
+            mamba_expand=self.mamba_expand,
+            mamba_variant=self.mamba_variant,
+            use_moe=self.use_moe,
+            moe_num_experts=self.moe_num_experts,
+            moe_top_k=self.moe_top_k,
+            moe_bottleneck_dim=self.moe_bottleneck_dim,
+            moe_temperature=self.moe_temperature,
+            moe_gate_dropout=self.moe_gate_dropout,
+            moe_balance_loss_weight=self.moe_balance_loss_weight,
+            moe_diversity_loss_weight=self.moe_diversity_loss_weight,
+            moe_z_loss_weight=self.moe_z_loss_weight,
+            use_normality_anchor=self.use_normality_anchor,
+            prototype_scale=self.prototype_scale,
+            prototype_margin_global=self.prototype_margin_global,
+            prototype_margin_expert=self.prototype_margin_expert,
+            router_use_distance=self.router_use_distance,
+        )
 
     def _scalarize_metrics(self, metrics):
         scalar_metrics = {}
@@ -854,22 +633,18 @@ class MetaLog:
         self.model.load_state_dict(load_checkpoint_state_dict(checkpoint_path), strict=strict)
 
 
-def build_template_encoder(dataset):
-    return Template_TF_IDF_without_clean() if dataset == 'NC' else Simple_template_TF_IDF()
-
-
 def build_semantic_encoder(parser_name, dataset, args=None):
-    if parser_name == 'parser_free':
-        cache_dir = get_protocol_option(args, 'plm_cache_dir', PARSER_FREE_DEFAULTS['cache_dir'])
-        return ParserFreeEncoder(
-            model_name=get_protocol_option(args, 'plm_model', PARSER_FREE_DEFAULTS['model_name']),
-            max_length=get_protocol_option(args, 'plm_max_length', PARSER_FREE_DEFAULTS['max_length']),
-            batch_size=get_protocol_option(args, 'plm_batch_size', PARSER_FREE_DEFAULTS['batch_size']),
-            pooling=get_protocol_option(args, 'plm_pooling', PARSER_FREE_DEFAULTS['pooling']),
-            cache_dir=cache_dir if cache_dir else None,
-            dataset=dataset,
-        )
-    return build_template_encoder(dataset)
+    if parser_name != 'parser_free':
+        raise ValueError('Unsupported parser: %s. Only parser_free is kept in the main pipeline.' % parser_name)
+    cache_dir = get_protocol_option(args, 'plm_cache_dir', PARSER_FREE_DEFAULTS['cache_dir'])
+    return ParserFreeEncoder(
+        model_name=get_protocol_option(args, 'plm_model', PARSER_FREE_DEFAULTS['model_name']),
+        max_length=get_protocol_option(args, 'plm_max_length', PARSER_FREE_DEFAULTS['max_length']),
+        batch_size=get_protocol_option(args, 'plm_batch_size', PARSER_FREE_DEFAULTS['batch_size']),
+        pooling=get_protocol_option(args, 'plm_pooling', PARSER_FREE_DEFAULTS['pooling']),
+        cache_dir=cache_dir if cache_dir else None,
+        dataset=dataset,
+    )
 
 
 def prepare_dataset(dataset, parser_name, semantic_encoder):
@@ -900,10 +675,6 @@ def prepare_protocol_context(direction_key, parser_name, protocol='clean', args=
     )
 
     rng = np.random.RandomState(seed)
-    force_fixed_threshold = False
-    pseudo_label_metrics = None
-    target_training_mode = 'none'
-    selection_on_target_test = False
     if protocol == 'clean':
         clean_config = CLEAN_DIRECTION_CONFIGS[direction_key]
         source_train_raw, _ = split_instances_by_ratio(source_instances, clean_config['source_ratio'], rng)
@@ -917,80 +688,7 @@ def prepare_protocol_context(direction_key, parser_name, protocol='clean', args=
         target_dev_raw = []
         selection_domain = 'target'
         selection_split_name = 'target-train'
-        target_embedding_raw = target_train_raw
         target_training_mode = 'gold'
-    elif protocol == 'clean_1pct_anomaly_only':
-        clean_config = CLEAN_1PCT_ANOMALY_ONLY_DIRECTION_CONFIGS[direction_key]
-        source_train_raw, _ = split_instances_by_ratio(source_instances, clean_config['source_ratio'], rng)
-        target_train_raw, target_test_raw = split_instances_by_grouped_label_ratios(
-            target_instances,
-            clean_config['target_normal_ratio'],
-            clean_config['target_anomaly_ratio'],
-            rng,
-        )
-        source_dev_raw = []
-        target_dev_raw = []
-        selection_domain = 'target'
-        selection_split_name = 'target-train'
-        target_embedding_raw = target_train_raw
-        target_training_mode = 'gold-anomaly-only'
-    elif protocol == 'metalog_repo_sample':
-        if direction_key == 'hdfs_to_bgl':
-            source_train_raw, source_dev_raw, _ = cut_by_415_metalog(source_instances, rng)
-            target_train_raw, target_dev_raw, target_test_raw = cut_by_316_filter_metalog(target_instances, rng)
-        elif direction_key == 'bgl_to_hdfs':
-            source_train_raw, source_dev_raw, _ = cut_all_metalog(source_instances, rng)
-            target_train_raw, target_dev_raw, target_test_raw = cut_by_253_filter_metalog(target_instances, rng)
-        else:
-            raise ValueError('Unsupported direction for metalog_repo_sample: %s' % direction_key)
-        selection_domain = 'target'
-        selection_split_name = 'target-train'
-        target_embedding_raw = target_train_raw
-        target_training_mode = 'gold'
-    elif protocol == 'metalog_repo_pseudo':
-        if direction_key == 'hdfs_to_bgl':
-            source_train_raw, source_dev_raw, _ = cut_by_415_metalog(source_instances, rng)
-            target_train_raw, target_dev_raw, target_test_raw = cut_by_316_filter_metalog(target_instances, rng)
-        elif direction_key == 'bgl_to_hdfs':
-            source_train_raw, source_dev_raw, _ = cut_all_metalog(source_instances, rng)
-            target_train_raw, target_dev_raw, target_test_raw = cut_by_253_filter_metalog(target_instances, rng)
-        else:
-            raise ValueError('Unsupported direction for metalog_repo_pseudo: %s' % direction_key)
-        target_train_raw = build_pseudo_labeled_target_train(
-            target_train_raw,
-            target_processor,
-            direction_key,
-            parser_name,
-            protocol,
-            args,
-        )
-        selection_domain = 'source'
-        selection_split_name = 'source-dev' if source_dev_raw else 'source-train'
-        target_embedding_raw = target_instances
-        force_fixed_threshold = True
-        target_training_mode = 'pseudo'
-        selection_on_target_test = True
-        pseudo_label_metrics = compute_effective_label_metrics(target_train_raw)
-    elif protocol == 'zero_shot':
-        if direction_key == 'hdfs_to_bgl':
-            source_train_raw, source_dev_raw, _ = cut_by_415_metalog(source_instances, rng)
-        elif direction_key == 'bgl_to_hdfs':
-            source_train_raw, source_dev_raw, _ = cut_all_metalog(source_instances, rng)
-        else:
-            raise ValueError('Unsupported direction for zero_shot: %s' % direction_key)
-        target_train_raw = []
-        target_dev_raw = []
-        target_test_raw = list(target_instances)
-        selection_domain = 'source'
-        selection_split_name = 'source-dev' if source_dev_raw else 'source-train'
-        # Zero-shot avoids target supervision during training/calibration while still
-        # allowing the evaluator to represent unseen target templates at test time.
-        target_embedding_raw = target_test_raw
-    elif protocol == 'metalog_repo_full':
-        raise NotImplementedError(
-            'protocol=metalog_repo_full is intentionally left unimplemented for now; '
-            'please use clean or metalog_repo_sample.'
-        )
     else:
         raise ValueError('Unknown protocol: %s' % protocol)
 
@@ -1010,13 +708,8 @@ def prepare_protocol_context(direction_key, parser_name, protocol='clean', args=
     target_test = remap_instances(target_test_raw, domain_mappings[direction.target_dataset])
     exact_overlap = count_exact_sequence_overlap(target_train, target_test)
     exact_dev_overlap = count_exact_sequence_overlap(target_train, target_dev)
-    if selection_on_target_test:
-        selection_split = target_test
-        selection_split_name = 'target-test'
-        warmup_select_by = 'selection_f1'
-    else:
-        selection_split = target_train if selection_domain == 'target' else (source_dev if source_dev else source_train)
-        warmup_select_by = 'selection_f1' if selection_domain == 'source' else 'loss'
+    selection_split = target_train if selection_domain == 'target' else (source_dev if source_dev else source_train)
+    warmup_select_by = 'selection_f1' if selection_domain == 'source' else 'loss'
 
     vocab = Vocab()
     vocab.load_from_dict(merged_embeddings)
@@ -1036,11 +729,8 @@ def prepare_protocol_context(direction_key, parser_name, protocol='clean', args=
         'uses_target_training': bool(target_train),
         'target_training_mode': target_training_mode,
         'warmup_select_by': warmup_select_by,
-        'force_fixed_threshold': force_fixed_threshold,
         'source_embedding_count': len(source_embeddings),
         'target_embedding_count': len(target_embeddings),
-        'selection_on_target_test': selection_on_target_test,
-        'pseudo_label_metrics': pseudo_label_metrics,
         'exact_target_dev_overlap': exact_dev_overlap,
         'exact_target_overlap': exact_overlap,
         'target_dev_oov_events': 0,
@@ -1116,7 +806,7 @@ def log_epoch_summary(logger, phase_name, epoch, metrics):
 def evaluate_target(metalog, context, args, split_name):
     selection_split = context['selection_split']
     selection_split_name = context['selection_split_name']
-    use_auto_threshold = args.auto_threshold and not context.get('force_fixed_threshold', False)
+    use_auto_threshold = args.auto_threshold
     if use_auto_threshold and not split_has_both_labels(selection_split):
         metalog.logger.info(
             'Selection split %s only has a single label; falling back to fixed threshold %.3f.'
@@ -1481,11 +1171,10 @@ def default_run_name(args, direction_name):
 def build_arg_parser():
     parser = argparse.ArgumentParser()
     parser.add_argument('--mode', type=str, default='train', help='train or test')
-    parser.add_argument('--parser', type=str, default='parser_free', choices=['parser_free', 'IBM'],
+    parser.add_argument('--parser', type=str, default='parser_free', choices=['parser_free'],
                         help='Input pipeline to use.')
     parser.add_argument('--protocol', type=str, default='clean',
-                        choices=['clean', 'clean_1pct_anomaly_only', 'metalog_repo_sample', 'metalog_repo_pseudo',
-                                 'metalog_repo_full', 'zero_shot'],
+                        choices=['clean'],
                         help='Data split protocol.')
     parser.add_argument('--plm_model', type=str, default=PARSER_FREE_DEFAULTS['model_name'],
                         help='Hugging Face model name used by parser-free encoding.')
@@ -1497,7 +1186,8 @@ def build_arg_parser():
                         choices=['mean', 'cls'], help='Pooling strategy for parser-free log encoding.')
     parser.add_argument('--plm_cache_dir', type=str, default=PARSER_FREE_DEFAULTS['cache_dir'],
                         help='Optional cache directory for parser-free text embeddings.')
-    parser.add_argument('--backbone', type=str, default='bimamba', help='gru or bimamba')
+    parser.add_argument('--backbone', type=str, default='bimamba', choices=['bimamba'],
+                        help='Backbone used by the main pipeline.')
     parser.add_argument('--mamba_state', type=int, default=mamba_state, help='BiMamba state expansion.')
     parser.add_argument('--mamba_conv', type=int, default=mamba_conv, help='BiMamba convolution width.')
     parser.add_argument('--mamba_expand', type=int, default=mamba_expand, help='BiMamba expansion factor.')
@@ -1526,14 +1216,6 @@ def build_arg_parser():
     parser.add_argument('--threshold_min', type=float, default=0.1, help='Lower bound for threshold sweep.')
     parser.add_argument('--threshold_max', type=float, default=0.9, help='Upper bound for threshold sweep.')
     parser.add_argument('--threshold_step', type=float, default=0.01, help='Step size for threshold sweep.')
-    parser.add_argument('--pseudo_min_cluster_size', type=int, default=PSEUDO_LABEL_DEFAULTS['min_cluster_size'],
-                        help='Pseudo-label HDBSCAN min_cluster_size for protocol=metalog_repo_pseudo.')
-    parser.add_argument('--pseudo_min_samples', type=int, default=PSEUDO_LABEL_DEFAULTS['min_samples'],
-                        help='Pseudo-label HDBSCAN min_samples for protocol=metalog_repo_pseudo.')
-    parser.add_argument('--pseudo_reduce_dimension', type=int, default=PSEUDO_LABEL_DEFAULTS['reduce_dimension'],
-                        help='FastICA dimension used before pseudo labeling; -1 disables reduction.')
-    parser.add_argument('--pseudo_normal_fraction', type=float, default=PSEUDO_LABEL_DEFAULTS['normal_fraction'],
-                        help='Fraction of target-train normals used as pseudo-label normal seeds.')
     parser.add_argument('--run_name', type=str, default='', help='Optional checkpoint prefix.')
     parser.add_argument('--checkpoint', type=str, default='',
                         help='Checkpoint path used when mode=test.')
@@ -1621,23 +1303,21 @@ def run_direction(direction_key, args):
         )
     )
     logger.info(
-        'Selection split=%s size=%d (%s) | target used in training=%s | selection leaks target test=%s'
+        'Selection split=%s size=%d (%s) | target used in training=%s'
         % (
             context['selection_split_name'],
             len(context['selection_split']),
             label_summary(context['selection_split']),
             'yes' if context['uses_target_training'] else 'no',
-            'yes' if context['selection_on_target_test'] else 'no',
         )
     )
     logger.info(
-        'Target supervision=%s | effective target-train=%s | source embeddings=%d target embeddings=%d | fixed threshold=%s'
+        'Target supervision=%s | effective target-train=%s | source embeddings=%d target embeddings=%d'
         % (
             context['target_training_mode'],
             label_summary(context['target_train'], use_training_labels=True),
             context['source_embedding_count'],
             context['target_embedding_count'],
-            'yes' if context['force_fixed_threshold'] else 'no',
         )
     )
     if args.parser == 'parser_free':
@@ -1650,20 +1330,6 @@ def run_direction(direction_key, args):
                 context['target_persistence_suffix'],
             )
         )
-    if context['pseudo_label_metrics'] is not None:
-        pseudo_metrics = context['pseudo_label_metrics']
-        logger.info(
-            'Target pseudo-label quality | precision=%.4f recall=%.4f f1=%.4f | TP=%d TN=%d FP=%d FN=%d'
-            % (
-                pseudo_metrics['precision'],
-                pseudo_metrics['recall'],
-                pseudo_metrics['f1'],
-                pseudo_metrics['TP'],
-                pseudo_metrics['TN'],
-                pseudo_metrics['FP'],
-                pseudo_metrics['FN'],
-            )
-        )
     logger.info(
         'Leakage guard stats | target dev overlap=%d | target test overlap=%d'
         % (
@@ -1671,8 +1337,6 @@ def run_direction(direction_key, args):
             context['exact_target_overlap'],
         )
     )
-    if context['force_fixed_threshold'] and args.auto_threshold:
-        logger.info('Protocol %s forces fixed threshold %.3f; ignoring --auto_threshold.' % (context['protocol'], args.threshold))
 
     if args.mode == 'test':
         checkpoint_path = args.checkpoint
@@ -1680,7 +1344,7 @@ def run_direction(direction_key, args):
             raise ValueError('mode=test requires --checkpoint.')
         threshold = args.threshold
         use_moe = context['uses_target_training'] or args.use_normality_anchor
-        if args.auto_threshold and not context['force_fixed_threshold']:
+        if args.auto_threshold:
             evaluator = MetaLog(
                 context['vocab'],
                 num_layer,
@@ -1725,7 +1389,7 @@ def run_direction(direction_key, args):
     warmup_checkpoint = run_warmup(context, args, checkpoint_prefix, select_by=context['warmup_select_by'])
     if not context['uses_target_training']:
         threshold = args.threshold
-        if args.auto_threshold and not context['force_fixed_threshold']:
+        if args.auto_threshold:
             evaluator = MetaLog(
                 context['vocab'],
                 num_layer,
