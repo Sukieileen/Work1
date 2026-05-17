@@ -18,7 +18,7 @@ from approaches.supervised_protocol import (
 def main():
     argparser = build_arg_parser()
     args, _ = argparser.parse_known_args()
-    run_direction('bgl_to_hdfs', args)
+    run_direction('hpc_to_hdfs', args)
 
 
 if __name__ == '__main__':

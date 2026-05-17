@@ -112,6 +112,8 @@ class LogNormalizer(object):
         text = self.hex_re.sub(' <hex> ', text)
         if self.dataset == 'BGL':
             text = self._normalize_bgl(text)
+        elif self.dataset == 'HPC':
+            text = self._normalize_hpc(text)
         for compiled_re in self.id_res:
             text = compiled_re.sub(' <id> ', text)
         text = self.float_re.sub(' <num> ', text)
@@ -168,6 +170,22 @@ class LogNormalizer(object):
             token_index += 1
 
         return ' '.join(normalized_tokens)
+
+    def _normalize_hpc(self, text):
+        text = self.bgl_datetime_re.sub(' <datetime> ', text)
+        text = self.bgl_colon_hexseq_re.sub(' <hexseq> ', text)
+        text = self.bgl_location_re.sub(' <loc> ', text)
+        text = self.bgl_slot_re.sub(' <slot> ', text)
+        text = self.bgl_hex8_re.sub(lambda match: ' %s ' % self._bucket_bgl_hex(match.group(0)), text)
+        text = self.bgl_long_hex_re.sub(' <hex> ', text)
+        text = self.bgl_assignment_re.sub(r'\1 <hex>', text)
+        text = re.sub(r'\b(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)\b', ' <month> ', text, flags=re.IGNORECASE)
+        text = re.sub(r'\b\d{1,2}:\d{2}:\d{2}\b', ' <clock> ', text)
+        text = re.sub(r'\b[a-z0-9._-]+@[a-z0-9._-]+\b', ' <hostref> ', text, flags=re.IGNORECASE)
+        text = re.sub(r'\b[a-z0-9._-]+/[a-z0-9._-]+\b', ' <hostpair> ', text, flags=re.IGNORECASE)
+        text = re.sub(r'\b[a-z0-9._-]+\[\d+\]\b', ' <proc> ', text, flags=re.IGNORECASE)
+        text = re.sub(r'\beventid:\s*\d+\b', ' eventid <num> ', text, flags=re.IGNORECASE)
+        return self._normalize_bgl(text)
 
     def _bucket_bgl_hex(self, token):
         lowered = token.lower()

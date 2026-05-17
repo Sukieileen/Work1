@@ -4,6 +4,7 @@ sys.path.extend([".", ".."])
 
 import argparse
 import csv
+import json
 import math
 from dataclasses import dataclass
 
@@ -38,27 +39,27 @@ class DirectionConfig:
 
 
 DIRECTION_CONFIGS = {
-    'hdfs_to_bgl': DirectionConfig(
-        name='hdfs_to_bgl',
+    'hdfs_to_hpc': DirectionConfig(
+        name='hdfs_to_hpc',
         source_dataset='HDFS',
-        target_dataset='BGL',
+        target_dataset='HPC',
     ),
-    'bgl_to_hdfs': DirectionConfig(
-        name='bgl_to_hdfs',
-        source_dataset='BGL',
+    'hpc_to_hdfs': DirectionConfig(
+        name='hpc_to_hdfs',
+        source_dataset='HPC',
         target_dataset='HDFS',
     ),
 }
 
 
 CLEAN_DIRECTION_CONFIGS = {
-    'hdfs_to_bgl': {
+    'hdfs_to_hpc': {
         'source_ratio': 0.3,
         'target_normal_ratio': 0.3,
         'target_anomaly_ratio': 0.01,
     },
-    'bgl_to_hdfs': {
-        'source_ratio': 1.0,
+    'hpc_to_hdfs': {
+        'source_ratio': 0.65,
         'target_normal_ratio': 0.1,
         'target_anomaly_ratio': 0.01,
     },
@@ -72,6 +73,19 @@ PARSER_FREE_DEFAULTS = {
     'pooling': 'mean',
     'cache_dir': '',
 }
+
+
+LOGSYNERGY_DEFAULT_ROOT = os.path.abspath(
+    os.path.join(PROJECT_ROOT, '..', 'Logsynergy', 'LogSynergy')
+)
+LOGSYNERGY_DEFAULT_PREPARED_ROOT = os.path.join(LOGSYNERGY_DEFAULT_ROOT, 'outputs', 'logsynergy_prepared')
+LOGSYNERGY_DEFAULT_LEI_CACHE_DIR = os.path.join(
+    LOGSYNERGY_DEFAULT_ROOT,
+    'outputs',
+    'metalog_runs',
+    'hpc_to_hdfs_lei_raw_aggnorm_gpu_v3_20260516',
+    'lei_cache',
+)
 
 
 def sanitize_probs(tag_logits):
@@ -659,6 +673,9 @@ def prepare_dataset(dataset, parser_name, semantic_encoder):
 
 
 def prepare_protocol_context(direction_key, parser_name, protocol='clean', args=None):
+    if parser_name == 'logsynergy_lei_cache':
+        return prepare_logsynergy_lei_protocol_context(direction_key, protocol=protocol, args=args)
+
     direction = DIRECTION_CONFIGS[direction_key]
     source_semantic_encoder = build_semantic_encoder(parser_name, direction.source_dataset, args)
     target_semantic_encoder = build_semantic_encoder(parser_name, direction.target_dataset, args)
@@ -737,6 +754,251 @@ def prepare_protocol_context(direction_key, parser_name, protocol='clean', args=
         'target_test_oov_events': 0,
         'source_persistence_suffix': getattr(source_semantic_encoder, 'persistence_suffix', ''),
         'target_persistence_suffix': getattr(target_semantic_encoder, 'persistence_suffix', ''),
+    }
+
+
+def _dataset_base(dataset_name):
+    return os.path.join(PROJECT_ROOT, 'datasets', dataset_name)
+
+
+def _load_raw_sequences(dataset_name):
+    seq_path = os.path.join(_dataset_base(dataset_name), 'raw_log_seqs.txt')
+    sequences = {}
+    with open(seq_path, 'r', encoding='utf-8') as reader:
+        for line in reader:
+            line = line.strip()
+            if not line:
+                continue
+            block_id, seq = line.split(':', 1)
+            sequences[block_id] = [int(item) for item in seq.split()]
+    return sequences
+
+
+def _load_raw_labels(dataset_name):
+    label_path = os.path.join(_dataset_base(dataset_name), 'label.txt')
+    labels = {}
+    with open(label_path, 'r', encoding='utf-8') as reader:
+        for line in reader:
+            line = line.strip()
+            if not line:
+                continue
+            if ':' in line:
+                block_id, label = line.split(':', 1)
+                labels[block_id] = label
+            else:
+                block_id, label = line.split(',', 1)
+                labels[block_id] = 'Anomalous' if int(label) == 1 else 'Normal'
+    return labels
+
+
+def _find_logsynergy_parser_dir(dataset_name, prepared_root, args):
+    explicit_attr = 'logsynergy_%s_parser_dir' % dataset_name.lower()
+    explicit_dir = getattr(args, explicit_attr, '') if args is not None else ''
+    if explicit_dir:
+        return explicit_dir
+
+    candidates = []
+    if not os.path.exists(prepared_root):
+        raise FileNotFoundError('LogSynergy prepared root not found: %s' % prepared_root)
+    for name in os.listdir(prepared_root):
+        parser_dir = os.path.join(prepared_root, name)
+        parser_config = os.path.join(parser_dir, 'parser_config.json')
+        if not os.path.exists(parser_config):
+            continue
+        with open(parser_config, 'r', encoding='utf-8') as reader:
+            config = json.load(reader)
+        if config.get('dataset') != dataset_name:
+            continue
+        if int(config.get('depth', -1)) != int(getattr(args, 'logsynergy_parser_depth', 4)):
+            continue
+        if float(config.get('st', -1.0)) != float(getattr(args, 'logsynergy_parser_st', 0.4)):
+            continue
+        if int(config.get('max_child', -1)) != int(getattr(args, 'logsynergy_parser_max_child', 100)):
+            continue
+        if bool(config.get('use_raw_messages', False)) != bool(getattr(args, 'logsynergy_parser_use_raw_messages', 0)):
+            continue
+        if bool(config.get('aggressive_normalize', False)) != bool(getattr(args, 'logsynergy_parser_aggressive_normalize', 1)):
+            continue
+        if int(config.get('max_lines', 0)) != 0:
+            continue
+        candidates.append((int(config.get('num_events', 0)), parser_dir))
+    if not candidates:
+        raise FileNotFoundError(
+            'No matching LogSynergy parser output for %s under %s. '
+            'Use --logsynergy_%s_parser_dir to specify it explicitly.'
+            % (dataset_name, prepared_root, dataset_name.lower())
+        )
+    candidates.sort()
+    return candidates[0][1]
+
+
+def _load_logsynergy_instances(dataset_name, parser_dir):
+    event_ids_path = os.path.join(parser_dir, 'log_event_ids.npy')
+    if not os.path.exists(event_ids_path):
+        raise FileNotFoundError('Missing LogSynergy event id array: %s' % event_ids_path)
+    log_event_ids = np.load(event_ids_path).astype(np.int64)
+    raw_sequences = _load_raw_sequences(dataset_name)
+    raw_labels = _load_raw_labels(dataset_name)
+    instances = []
+    for block_id, raw_indices in raw_sequences.items():
+        sequence = [int(log_event_ids[idx]) for idx in raw_indices if idx < len(log_event_ids)]
+        if sequence:
+            instances.append(Instance(block_id, sequence, raw_labels.get(block_id, 'Normal')))
+    return instances
+
+
+def _load_cached_protocol_instances(dataset_name):
+    input_path = os.path.join(_dataset_base(dataset_name), 'inputs', 'parser_free', 'train')
+    if not os.path.exists(input_path):
+        raise FileNotFoundError('Missing MetaLog cached protocol file: %s' % input_path)
+    instances = []
+    with open(input_path, 'r', encoding='utf-8') as reader:
+        while True:
+            seq_line = reader.readline()
+            if not seq_line:
+                break
+            meta_line = reader.readline()
+            reader.readline()
+
+            seq_line = seq_line.strip()
+            meta_line = meta_line.strip()
+            if not seq_line or not meta_line:
+                continue
+            sequence = [int(item) for item in seq_line.split()]
+            block_id, label = meta_line.split(',')[:2]
+            instances.append(Instance(block_id, sequence, label))
+    if not instances:
+        raise ValueError('No cached protocol instances found for %s at %s' % (dataset_name, input_path))
+    return instances
+
+
+def _load_logsynergy_embeddings(dataset_name, lei_cache_dir):
+    npz_path = os.path.join(lei_cache_dir, '%s_embeddings.npz' % dataset_name.lower())
+    if not os.path.exists(npz_path):
+        raise FileNotFoundError('Missing LogSynergy LEI embedding cache: %s' % npz_path)
+    payload = np.load(npz_path)
+    event_ids = payload['event_ids'].astype(np.int64).tolist()
+    vectors = payload['vectors'].astype(np.float32)
+    return {int(event_id): vector for event_id, vector in zip(event_ids, vectors)}
+
+
+def _instances_by_block_id(instances):
+    return {inst.id: inst for inst in instances}
+
+
+def _project_instances_by_block_id(reference_instances, candidate_instances):
+    candidate_by_block_id = _instances_by_block_id(candidate_instances)
+    projected = []
+    missing = []
+    for reference in reference_instances:
+        instance = candidate_by_block_id.get(reference.id)
+        if instance is None:
+            missing.append(reference.id)
+        else:
+            projected.append(instance)
+    if missing:
+        raise ValueError('Missing %d block ids while aligning LogSynergy split. First missing: %s' % (
+            len(missing),
+            missing[:10],
+        ))
+    return projected
+
+
+def prepare_logsynergy_lei_protocol_context(direction_key, protocol='clean', args=None):
+    if protocol != 'clean':
+        raise ValueError('Unknown protocol: %s' % protocol)
+    direction = DIRECTION_CONFIGS[direction_key]
+    prepared_root = getattr(args, 'logsynergy_prepared_root', LOGSYNERGY_DEFAULT_PREPARED_ROOT)
+    lei_cache_dir = getattr(args, 'logsynergy_lei_cache_dir', LOGSYNERGY_DEFAULT_LEI_CACHE_DIR)
+
+    source_parser_dir = _find_logsynergy_parser_dir(direction.source_dataset, prepared_root, args)
+    target_parser_dir = _find_logsynergy_parser_dir(direction.target_dataset, prepared_root, args)
+    source_instances = _load_logsynergy_instances(direction.source_dataset, source_parser_dir)
+    target_instances = _load_logsynergy_instances(direction.target_dataset, target_parser_dir)
+
+    rng = np.random.RandomState(seed)
+    clean_config = CLEAN_DIRECTION_CONFIGS[direction_key]
+    source_train_raw, source_holdout_raw = split_instances_by_ratio(
+        source_instances,
+        clean_config['source_ratio'],
+        rng,
+    )
+    target_train_raw, target_test_raw = split_instances_by_grouped_label_ratios(
+        target_instances,
+        clean_config['target_normal_ratio'],
+        clean_config['target_anomaly_ratio'],
+        rng,
+    )
+
+    # Align to the original MetaLog clean-protocol block ids where possible so the
+    # protocol size stays identical while only event ids/embeddings change.
+    clean_source_instances = _load_cached_protocol_instances(direction.source_dataset)
+    clean_target_instances = _load_cached_protocol_instances(direction.target_dataset)
+    clean_rng = np.random.RandomState(seed)
+    clean_source_train, _ = split_instances_by_ratio(
+        clean_source_instances,
+        clean_config['source_ratio'],
+        clean_rng,
+    )
+    clean_target_train, clean_target_test = split_instances_by_grouped_label_ratios(
+        clean_target_instances,
+        clean_config['target_normal_ratio'],
+        clean_config['target_anomaly_ratio'],
+        clean_rng,
+    )
+    source_train_raw = _project_instances_by_block_id(clean_source_train, source_instances)
+    target_train_raw = _project_instances_by_block_id(clean_target_train, target_instances)
+    target_test_raw = _project_instances_by_block_id(clean_target_test, target_instances)
+    source_dev_raw = []
+    target_dev_raw = []
+    selection_domain = 'target'
+    selection_split_name = 'target-train'
+    target_training_mode = 'gold'
+
+    source_embeddings = _load_logsynergy_embeddings(direction.source_dataset, lei_cache_dir)
+    target_embeddings = _load_logsynergy_embeddings(direction.target_dataset, lei_cache_dir)
+    merged_embeddings, domain_mappings = build_merged_embeddings({
+        direction.source_dataset: source_embeddings,
+        direction.target_dataset: target_embeddings,
+    })
+
+    source_train = remap_instances(source_train_raw, domain_mappings[direction.source_dataset])
+    target_train = remap_instances(target_train_raw, domain_mappings[direction.target_dataset])
+    target_test = remap_instances(target_test_raw, domain_mappings[direction.target_dataset])
+    source_dev = []
+    target_dev = []
+    exact_overlap = count_exact_sequence_overlap(target_train, target_test)
+    exact_dev_overlap = count_exact_sequence_overlap(target_train, target_dev)
+    selection_split = target_train if selection_domain == 'target' else source_train
+    warmup_select_by = 'loss'
+
+    vocab = Vocab()
+    vocab.load_from_dict(merged_embeddings)
+
+    return {
+        'direction': direction,
+        'protocol': protocol,
+        'vocab': vocab,
+        'label2id': {'Normal': 0, 'Anomalous': 1},
+        'source_train': source_train,
+        'source_dev': source_dev,
+        'target_train': target_train,
+        'target_dev': target_dev,
+        'target_test': target_test,
+        'selection_split': selection_split,
+        'selection_split_name': selection_split_name,
+        'uses_target_training': bool(target_train),
+        'target_training_mode': target_training_mode,
+        'warmup_select_by': warmup_select_by,
+        'source_embedding_count': len(source_embeddings),
+        'target_embedding_count': len(target_embeddings),
+        'exact_target_dev_overlap': exact_dev_overlap,
+        'exact_target_overlap': exact_overlap,
+        'target_dev_oov_events': 0,
+        'target_test_oov_events': 0,
+        'source_persistence_suffix': source_parser_dir,
+        'target_persistence_suffix': target_parser_dir,
+        'logsynergy_lei_cache_dir': lei_cache_dir,
     }
 
 
@@ -1171,7 +1433,7 @@ def default_run_name(args, direction_name):
 def build_arg_parser():
     parser = argparse.ArgumentParser()
     parser.add_argument('--mode', type=str, default='train', help='train or test')
-    parser.add_argument('--parser', type=str, default='parser_free', choices=['parser_free'],
+    parser.add_argument('--parser', type=str, default='parser_free', choices=['parser_free', 'logsynergy_lei_cache'],
                         help='Input pipeline to use.')
     parser.add_argument('--protocol', type=str, default='clean',
                         choices=['clean'],
@@ -1186,6 +1448,24 @@ def build_arg_parser():
                         choices=['mean', 'cls'], help='Pooling strategy for parser-free log encoding.')
     parser.add_argument('--plm_cache_dir', type=str, default=PARSER_FREE_DEFAULTS['cache_dir'],
                         help='Optional cache directory for parser-free text embeddings.')
+    parser.add_argument('--logsynergy_prepared_root', type=str, default=LOGSYNERGY_DEFAULT_PREPARED_ROOT,
+                        help='LogSynergy prepared parser-output root used by --parser logsynergy_lei_cache.')
+    parser.add_argument('--logsynergy_lei_cache_dir', type=str, default=LOGSYNERGY_DEFAULT_LEI_CACHE_DIR,
+                        help='LogSynergy LEI cache dir containing interpretations.jsonl and *_embeddings.npz.')
+    parser.add_argument('--logsynergy_hpc_parser_dir', type=str, default='',
+                        help='Optional explicit LogSynergy HPC parser output directory.')
+    parser.add_argument('--logsynergy_hdfs_parser_dir', type=str, default='',
+                        help='Optional explicit LogSynergy HDFS parser output directory.')
+    parser.add_argument('--logsynergy_parser_depth', type=int, default=4,
+                        help='LogSynergy parser depth expected in parser_config.json.')
+    parser.add_argument('--logsynergy_parser_st', type=float, default=0.4,
+                        help='LogSynergy parser similarity threshold expected in parser_config.json.')
+    parser.add_argument('--logsynergy_parser_max_child', type=int, default=100,
+                        help='LogSynergy parser max_child expected in parser_config.json.')
+    parser.add_argument('--logsynergy_parser_use_raw_messages', type=int, default=0,
+                        help='LogSynergy parser use_raw_messages flag expected in parser_config.json.')
+    parser.add_argument('--logsynergy_parser_aggressive_normalize', type=int, default=1,
+                        help='LogSynergy parser aggressive_normalize flag expected in parser_config.json.')
     parser.add_argument('--backbone', type=str, default='bimamba', choices=['bimamba'],
                         help='Backbone used by the main pipeline.')
     parser.add_argument('--mamba_state', type=int, default=mamba_state, help='BiMamba state expansion.')
@@ -1328,6 +1608,17 @@ def run_direction(direction_key, args):
                 context['source_persistence_suffix'],
                 context['direction'].target_dataset,
                 context['target_persistence_suffix'],
+            )
+        )
+    elif args.parser == 'logsynergy_lei_cache':
+        logger.info(
+            'LogSynergy LEI cache | %s=%s | %s=%s | cache=%s'
+            % (
+                context['direction'].source_dataset,
+                context['source_persistence_suffix'],
+                context['direction'].target_dataset,
+                context['target_persistence_suffix'],
+                context['logsynergy_lei_cache_dir'],
             )
         )
     logger.info(

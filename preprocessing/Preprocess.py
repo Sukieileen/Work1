@@ -2,6 +2,7 @@ from CONSTANTS import *
 from entities.instances import Instance
 from preprocessing.dataloader.BGLLoader import BGLLoader
 from preprocessing.dataloader.HDFSLoader import HDFSLoader
+from preprocessing.dataloader.HPCLoader import HPCLoader
 
 
 class Preprocessor:
@@ -69,8 +70,19 @@ class Preprocessor:
             dataset_base = os.path.join(PROJECT_ROOT, 'datasets/' + dataset)
             dataloader = BGLLoader(in_file=in_file, dataset_base=dataset_base,
                                    semantic_repr_func=semantic_repr_func)
+        elif dataset == 'HPC':
+            in_file = os.path.join(PROJECT_ROOT, 'datasets/HPC/HPC.log')
+            dataset_base = os.path.join(PROJECT_ROOT, 'datasets/HPC')
+            dataloader = HPCLoader(
+                in_file=in_file,
+                dataset_base=dataset_base,
+                semantic_repr_func=semantic_repr_func,
+                remove_col_count=8,
+                group_key_index=3,
+                normal_prefix='-',
+            )
         else:
-            raise ValueError('Unsupported dataset: %s. Only HDFS/BGL main-pipeline datasets are kept.' % dataset)
+            raise ValueError('Unsupported dataset: %s. Only HDFS/BGL/HPC main-pipeline datasets are kept.' % dataset)
 
         self.dataloader = dataloader
 
