@@ -44,6 +44,11 @@ DIRECTION_CONFIGS = {
         source_dataset='HDFS',
         target_dataset='HPC',
     ),
+    'hdfs_to_hpc_sr065': DirectionConfig(
+        name='hdfs_to_hpc_sr065',
+        source_dataset='HDFS',
+        target_dataset='HPC_sr065',
+    ),
     'hpc_to_hdfs': DirectionConfig(
         name='hpc_to_hdfs',
         source_dataset='HPC',
@@ -54,6 +59,11 @@ DIRECTION_CONFIGS = {
 
 CLEAN_DIRECTION_CONFIGS = {
     'hdfs_to_hpc': {
+        'source_ratio': 0.3,
+        'target_normal_ratio': 0.3,
+        'target_anomaly_ratio': 0.01,
+    },
+    'hdfs_to_hpc_sr065': {
         'source_ratio': 0.3,
         'target_normal_ratio': 0.3,
         'target_anomaly_ratio': 0.01,
@@ -1433,6 +1443,8 @@ def default_run_name(args, direction_name):
 def build_arg_parser():
     parser = argparse.ArgumentParser()
     parser.add_argument('--mode', type=str, default='train', help='train or test')
+    parser.add_argument('--direction', type=str, default='', choices=[''] + sorted(DIRECTION_CONFIGS.keys()),
+                        help='Optional direction override for wrapper entrypoints.')
     parser.add_argument('--parser', type=str, default='parser_free', choices=['parser_free', 'logsynergy_lei_cache'],
                         help='Input pipeline to use.')
     parser.add_argument('--protocol', type=str, default='clean',

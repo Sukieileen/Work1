@@ -112,7 +112,7 @@ class LogNormalizer(object):
         text = self.hex_re.sub(' <hex> ', text)
         if self.dataset == 'BGL':
             text = self._normalize_bgl(text)
-        elif self.dataset == 'HPC':
+        elif self.dataset == 'HPC' or self.dataset.startswith('HPC_'):
             text = self._normalize_hpc(text)
         for compiled_re in self.id_res:
             text = compiled_re.sub(' <id> ', text)

@@ -70,9 +70,9 @@ class Preprocessor:
             dataset_base = os.path.join(PROJECT_ROOT, 'datasets/' + dataset)
             dataloader = BGLLoader(in_file=in_file, dataset_base=dataset_base,
                                    semantic_repr_func=semantic_repr_func)
-        elif dataset == 'HPC':
-            in_file = os.path.join(PROJECT_ROOT, 'datasets/HPC/HPC.log')
-            dataset_base = os.path.join(PROJECT_ROOT, 'datasets/HPC')
+        elif dataset == 'HPC' or dataset.startswith('HPC_'):
+            in_file = os.path.join(PROJECT_ROOT, 'datasets/' + dataset + '/HPC.log')
+            dataset_base = os.path.join(PROJECT_ROOT, 'datasets/' + dataset)
             dataloader = HPCLoader(
                 in_file=in_file,
                 dataset_base=dataset_base,
