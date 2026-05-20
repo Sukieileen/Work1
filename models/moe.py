@@ -25,6 +25,10 @@ class LatentMoEClassifier(nn.Module):
         prototype_margin_global=1.0,
         prototype_margin_expert=1.0,
         router_use_distance=True,
+        router_distance_mode='expert_bias',
+        router_distance_scale=1.0,
+        use_global_prototype=False,
+        prototype_diversity_margin=0.5,
     ):
         super(LatentMoEClassifier, self).__init__()
         if num_experts < 1:
@@ -44,10 +48,14 @@ class LatentMoEClassifier(nn.Module):
         self.use_normality_anchor = bool(use_normality_anchor)
         self.prototype_scale = float(prototype_scale)
         self.router_use_distance = bool(router_use_distance and self.use_normality_anchor)
+        self.router_distance_mode = str(router_distance_mode).lower()
+        self.router_distance_scale = float(router_distance_scale)
+        self.use_global_prototype = bool(use_global_prototype)
+        self.prototype_diversity_margin = float(prototype_diversity_margin)
         self.eps = 1e-9
 
         self.input_norm = nn.LayerNorm(input_dim)
-        self.router_feature_dim = input_dim + (2 if self.router_use_distance else 0)
+        self.router_feature_dim = self._resolve_router_feature_dim()
         self.router_feature_norm = nn.LayerNorm(self.router_feature_dim)
         self.router_dropout = nn.Dropout(gate_dropout) if gate_dropout > 0 else nn.Identity()
         self.router = nn.Linear(self.router_feature_dim, num_experts)
@@ -66,6 +74,8 @@ class LatentMoEClassifier(nn.Module):
                 num_experts=num_experts,
                 margin_global=prototype_margin_global,
                 margin_expert=prototype_margin_expert,
+                use_global_prototype=use_global_prototype,
+                diversity_margin=prototype_diversity_margin,
                 eps=self.eps,
             )
             if self.use_normality_anchor else None
@@ -85,11 +95,34 @@ class LatentMoEClassifier(nn.Module):
         if self.prototype_bank is not None:
             self.prototype_bank.reset_parameters()
 
-    def _build_router_features(self, inputs, normalized_inputs, global_distance):
+    def _resolve_router_feature_dim(self):
+        if not self.router_use_distance:
+            return self.input_dim
+        if self.router_distance_mode == 'global_concat':
+            return self.input_dim + 2
+        if self.router_distance_mode in ('expert_concat', 'expert_concat_bias'):
+            return self.input_dim + self.num_experts + 1
+        if self.router_distance_mode in ('expert_bias', 'none'):
+            return self.input_dim
+        raise ValueError('Unsupported router_distance_mode: %s' % self.router_distance_mode)
+
+    def _build_router_features(self, inputs, normalized_inputs, global_distance, base_expert_distances):
         if not self.router_use_distance:
             return normalized_inputs
         feature_norm = torch.norm(inputs, p=2, dim=-1, keepdim=True) / math.sqrt(float(self.input_dim))
-        return torch.cat([normalized_inputs, global_distance.unsqueeze(-1), feature_norm], dim=-1)
+        if self.router_distance_mode == 'global_concat':
+            return torch.cat([normalized_inputs, global_distance.unsqueeze(-1), feature_norm], dim=-1)
+        if self.router_distance_mode in ('expert_concat', 'expert_concat_bias'):
+            return torch.cat([normalized_inputs, base_expert_distances, feature_norm], dim=-1)
+        if self.router_distance_mode in ('expert_bias', 'none'):
+            return normalized_inputs
+        raise ValueError('Unsupported router_distance_mode: %s' % self.router_distance_mode)
+
+    def _distance_bias(self, base_expert_distances):
+        distance_bias = torch.log1p(base_expert_distances)
+        distance_bias = distance_bias - distance_bias.mean(dim=-1, keepdim=True)
+        distance_scale = distance_bias.std(dim=-1, keepdim=True, unbiased=False).clamp_min(self.eps)
+        return distance_bias / distance_scale
 
     def _select_from_cache(self, key, batch_slice=None):
         cached_value = self._last_cache.get(key)
@@ -102,13 +135,22 @@ class LatentMoEClassifier(nn.Module):
     def forward(self, inputs):
         normalized_inputs = self.input_norm(inputs)
         if self.prototype_bank is not None:
+            base_expert_distances = self.prototype_bank.expert_distance_from_base(inputs)
             global_distance = self.prototype_bank.global_distance(inputs)
         else:
+            base_expert_distances = inputs.new_zeros(inputs.size(0), self.num_experts)
             global_distance = inputs.new_zeros(inputs.size(0))
 
-        router_features = self._build_router_features(inputs, normalized_inputs, global_distance)
+        router_features = self._build_router_features(
+            inputs,
+            normalized_inputs,
+            global_distance,
+            base_expert_distances,
+        )
         router_inputs = self.router_dropout(self.router_feature_norm(router_features))
         router_logits = self.router(router_inputs)
+        if self.router_use_distance and self.router_distance_mode in ('expert_bias', 'expert_concat_bias'):
+            router_logits = router_logits - self.router_distance_scale * self._distance_bias(base_expert_distances)
         routing_probs = F.softmax(router_logits / self.temperature, dim=-1)
 
         if self.top_k == self.num_experts:
@@ -136,7 +178,7 @@ class LatentMoEClassifier(nn.Module):
         expert_deltas = torch.stack(expert_deltas, dim=1)
         expert_representations = torch.stack(expert_representations, dim=1)
         if self.prototype_bank is not None:
-            expert_distances = self.prototype_bank.expert_distance(expert_representations)
+            expert_distances = self.prototype_bank.expert_distance_from_expert_repr(expert_representations)
             proto_logits = self.prototype_scale * torch.stack([-expert_distances, expert_distances], dim=-1)
             expert_logits = expert_logits + proto_logits
         else:
@@ -165,6 +207,9 @@ class LatentMoEClassifier(nn.Module):
             'moe_load_std': (
                 routing_mask.sum(dim=0) / (routing_mask.sum() + self.eps)
             ).std(unbiased=False).detach(),
+            'proto_base_distance_min': base_expert_distances.min(dim=-1).values.mean().detach(),
+            'proto_base_distance_mean': base_expert_distances.mean(dim=-1).mean().detach(),
+            'router_distance_scale': routing_probs.new_tensor(self.router_distance_scale).detach(),
         }
         self._last_cache = {
             'base_repr': inputs,
@@ -172,7 +217,9 @@ class LatentMoEClassifier(nn.Module):
             'expert_repr': expert_representations,
             'routing_probs': sparse_probs,
             'routing_mask': routing_mask,
+            'router_logits': router_logits,
             'global_distance': global_distance,
+            'base_expert_distance': base_expert_distances,
             'expert_distance': expert_distances,
         }
         return final_logits

@@ -98,7 +98,8 @@ class AttBiMambaModel(nn.Module):
                  moe_bottleneck_dim=None, moe_temperature=1.5, moe_gate_dropout=0.1,
                  moe_balance_loss_weight=1e-2, moe_diversity_loss_weight=1e-3, moe_z_loss_weight=0.0,
                  use_normality_anchor=True, prototype_scale=1.0, prototype_margin_global=1.0,
-                 prototype_margin_expert=1.0, router_use_distance=True):
+                 prototype_margin_expert=1.0, router_use_distance=True, router_distance_mode='expert_bias',
+                 router_distance_scale=1.0, use_global_prototype=False, prototype_diversity_margin=0.5):
         super(AttBiMambaModel, self).__init__()
         self.dropout = dropout
         self.use_moe = use_moe
@@ -141,6 +142,10 @@ class AttBiMambaModel(nn.Module):
                 prototype_margin_global=prototype_margin_global,
                 prototype_margin_expert=prototype_margin_expert,
                 router_use_distance=router_use_distance,
+                router_distance_mode=router_distance_mode,
+                router_distance_scale=router_distance_scale,
+                use_global_prototype=use_global_prototype,
+                prototype_diversity_margin=prototype_diversity_margin,
             )
         else:
             self.proj = NonLinear(self.sent_dim, 2)
@@ -157,7 +162,9 @@ class AttBiMambaModel(nn.Module):
         if self.use_moe:
             self.logger.info('MoE Enabled: experts=%d, top_k=%d, bottleneck_dim=%s, temperature=%.3f, '
                              'balance_weight=%.4g, diversity_weight=%.4g, z_weight=%.4g, '
-                             'normality_anchor=%s, prototype_scale=%.3f, router_use_distance=%s'
+                             'normality_anchor=%s, prototype_scale=%.3f, router_use_distance=%s, '
+                             'router_distance_mode=%s, router_distance_scale=%.3f, '
+                             'use_global_prototype=%s, prototype_diversity_margin=%.3f'
                              % (
                                  moe_num_experts,
                                  min(moe_top_k, moe_num_experts),
@@ -169,6 +176,10 @@ class AttBiMambaModel(nn.Module):
                                  'on' if use_normality_anchor else 'off',
                                  prototype_scale,
                                  'on' if router_use_distance else 'off',
+                                 router_distance_mode,
+                                 router_distance_scale,
+                                 'on' if use_global_prototype else 'off',
+                                 prototype_diversity_margin,
                              ))
 
     def reset_word_embed_weight(self, vocab, pretrained_embedding):

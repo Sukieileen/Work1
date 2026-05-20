@@ -1,6 +1,7 @@
 from CONSTANTS import *
 from entities.instances import Instance
 from preprocessing.dataloader.BGLLoader import BGLLoader
+from preprocessing.dataloader.GenericRawLogLoader import GenericRawLogLoader
 from preprocessing.dataloader.HDFSLoader import HDFSLoader
 from preprocessing.dataloader.HPCLoader import HPCLoader
 
@@ -80,6 +81,55 @@ class Preprocessor:
                 remove_col_count=8,
                 group_key_index=3,
                 normal_prefix='-',
+            )
+        elif dataset == 'OpenStack':
+            dataset_base = os.path.join(PROJECT_ROOT, 'datasets/OpenStack')
+            if not os.path.exists(dataset_base):
+                dataset_base = os.path.join(PROJECT_ROOT, 'datasets/openstack')
+            normal_files = [
+                os.path.join(dataset_base, 'openstack_normal1.log'),
+                os.path.join(dataset_base, 'openstack_normal2.log'),
+            ]
+            normal_files = [path for path in normal_files if os.path.exists(path)]
+            if not normal_files:
+                archive_path = os.path.join(dataset_base, 'OpenStack.tar.gz')
+                normal_files = [
+                    'openstack_normal1.log',
+                    'openstack_normal2.log',
+                ]
+                anomalous_files = ['openstack_abnormal.log']
+                raw_format = 'tar.gz'
+            else:
+                archive_path = None
+                anomalous_files = [os.path.join(dataset_base, 'openstack_abnormal.log')]
+                raw_format = 'plain'
+            dataloader = GenericRawLogLoader(
+                in_file=archive_path,
+                dataset_base=dataset_base,
+                semantic_repr_func=semantic_repr_func,
+                window_size=20,
+                mode='openstack',
+                normal_files=normal_files,
+                anomalous_files=anomalous_files,
+                openstack_format=True,
+                raw_format=raw_format,
+            )
+        elif dataset == 'SPIRIT' or dataset == 'Spirit':
+            dataset_base = os.path.join(PROJECT_ROOT, 'datasets/SPIRIT')
+            if not os.path.exists(dataset_base):
+                dataset_base = os.path.join(PROJECT_ROOT, 'datasets/spirit')
+            gz_path = os.path.join(dataset_base, 'spirit2 (1).gz')
+            dataloader = GenericRawLogLoader(
+                in_file=gz_path,
+                dataset_base=dataset_base,
+                semantic_repr_func=semantic_repr_func,
+                window_size=120,
+                remove_col_count=8,
+                group_key_index=3,
+                normal_prefix='-',
+                raw_format='gz',
+                mode='hpc',
+                max_lines=int(getattr(template_encoding, 'spirit_max_lines', 0) or 0),
             )
         else:
             raise ValueError('Unsupported dataset: %s. Only HDFS/BGL/HPC main-pipeline datasets are kept.' % dataset)

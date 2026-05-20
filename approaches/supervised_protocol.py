@@ -6,7 +6,7 @@ import argparse
 import csv
 import json
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from CONSTANTS import *
 from entities.TensorInstances import TInstWithLogits
@@ -51,8 +51,13 @@ DIRECTION_CONFIGS = {
     ),
     'hpc_to_hdfs': DirectionConfig(
         name='hpc_to_hdfs',
-        source_dataset='HPC',
+        source_dataset='HPC_sr065',
         target_dataset='HDFS',
+    ),
+    'hdfs30_hpc065_known_mix': DirectionConfig(
+        name='hdfs30_hpc065_known_mix',
+        source_dataset='HDFS30+HPC_sr065',
+        target_dataset='HDFS30+HPC_sr065',
     ),
 }
 
@@ -72,6 +77,11 @@ CLEAN_DIRECTION_CONFIGS = {
         'source_ratio': 0.65,
         'target_normal_ratio': 0.1,
         'target_anomaly_ratio': 0.01,
+    },
+    'hdfs30_hpc065_known_mix': {
+        'source_ratio': 0.3,
+        'target_normal_ratio': 1.0,
+        'target_anomaly_ratio': 1.0,
     },
 }
 
@@ -129,6 +139,43 @@ def append_epoch_metrics(csv_file, row):
         'test_auroc',
         'test_aucpr',
         'selected_for_best',
+    ]
+    output_dir = os.path.dirname(csv_file)
+    if output_dir and not os.path.exists(output_dir):
+        os.makedirs(output_dir)
+    write_header = not os.path.exists(csv_file)
+    with open(csv_file, 'a', encoding='utf-8', newline='') as writer:
+        csv_writer = csv.DictWriter(writer, fieldnames=fieldnames)
+        if write_header:
+            csv_writer.writeheader()
+        csv_writer.writerow(row)
+
+
+def append_zero_epoch_metrics(csv_file, row):
+    fieldnames = [
+        'train_direction',
+        'phase',
+        'epoch',
+        'zero_target',
+        'method',
+        'precision',
+        'recall',
+        'f1',
+        'threshold',
+        'threshold_source',
+        'checkpoint',
+        'total',
+        'normal',
+        'anomalous',
+        'tp',
+        'tn',
+        'fp',
+        'fn',
+        'known_selection_f1',
+        'known_test_f1',
+        'known_event_count',
+        'zero_event_count',
+        'zero_instance_count',
     ]
     output_dir = os.path.dirname(csv_file)
     if output_dir and not os.path.exists(output_dir):
@@ -237,6 +284,43 @@ def split_instances_by_grouped_label_ratios(instances, normal_ratio, anomaly_rat
     rng.shuffle(train_instances)
     rng.shuffle(test_instances)
     return train_instances, test_instances
+
+
+def split_instances_by_label_ratio(instances, ratio, rng):
+    label_groups = {}
+    for inst in instances:
+        label_groups.setdefault(inst.label, []).append(inst)
+
+    selected = []
+    remainder = []
+    for label, group in label_groups.items():
+        group = list(group)
+        rng.shuffle(group)
+        train_size = int(len(group) * ratio)
+        selected.extend(group[:train_size])
+        remainder.extend(group[train_size:])
+    rng.shuffle(selected)
+    rng.shuffle(remainder)
+    return selected, remainder
+
+
+def sample_instances_by_label_ratio(instances, ratio, rng):
+    if ratio <= 0:
+        return []
+    label_groups = {}
+    for inst in instances:
+        label_groups.setdefault(inst.label, []).append(inst)
+
+    sampled = []
+    for _, group in label_groups.items():
+        group = list(group)
+        rng.shuffle(group)
+        sample_size = int(len(group) * ratio)
+        if len(group) > 0 and sample_size == 0:
+            sample_size = 1
+        sampled.extend(group[:sample_size])
+    rng.shuffle(sampled)
+    return sampled
 
 
 def collect_event_ids(instances):
@@ -370,7 +454,9 @@ class MetaLog:
                  moe_balance_loss_weight=1e-2, moe_diversity_loss_weight=1e-3, moe_z_loss_weight=0.0,
                  use_normality_anchor=True, prototype_scale=1.0, prototype_loss_weight=0.1,
                  prototype_sep_weight=1e-3, prototype_margin_global=1.0, prototype_margin_expert=1.0,
-                 prototype_target_normal_only=True, router_use_distance=True):
+                 prototype_target_normal_only=True, router_use_distance=True,
+                 router_distance_mode='expert_bias', router_distance_scale=1.0,
+                 use_global_prototype=False, prototype_diversity_margin=0.5, eval_batch_size=32):
         self.label2id = label2id
         self.vocab = vocab
         self.num_layer = num_layer
@@ -398,6 +484,11 @@ class MetaLog:
         self.prototype_margin_expert = prototype_margin_expert
         self.prototype_target_normal_only = prototype_target_normal_only
         self.router_use_distance = router_use_distance
+        self.router_distance_mode = router_distance_mode
+        self.router_distance_scale = router_distance_scale
+        self.use_global_prototype = use_global_prototype
+        self.prototype_diversity_margin = prototype_diversity_margin
+        self.eval_batch_size = max(1, int(eval_batch_size))
         self.model = self._build_model()
         if torch.cuda.is_available():
             self.model = self.model.cuda(device)
@@ -430,6 +521,10 @@ class MetaLog:
             prototype_margin_global=self.prototype_margin_global,
             prototype_margin_expert=self.prototype_margin_expert,
             router_use_distance=self.router_use_distance,
+            router_distance_mode=self.router_distance_mode,
+            router_distance_scale=self.router_distance_scale,
+            use_global_prototype=self.use_global_prototype,
+            prototype_diversity_margin=self.prototype_diversity_margin,
         )
 
     def _scalarize_metrics(self, metrics):
@@ -576,7 +671,7 @@ class MetaLog:
         with torch.no_grad():
             self.model.eval()
             local_rng = np.random.RandomState(seed)
-            for batch in iterate_batches(instances, 1024, local_rng, shuffle=False):
+            for batch in iterate_batches(instances, self.eval_batch_size, local_rng, shuffle=False):
                 tinst = build_training_tinsts(batch, vocab)
                 move_tinst_to_runtime_device(tinst)
                 tag_probs = sanitize_probs(self.model(tinst.inputs))
@@ -654,14 +749,18 @@ class MetaLog:
         return best_metrics['threshold'], best_metrics
 
     def load_model_state(self, checkpoint_path, strict=True):
-        self.model.load_state_dict(load_checkpoint_state_dict(checkpoint_path), strict=strict)
+        state_dict = load_checkpoint_state_dict(checkpoint_path)
+        if strict:
+            load_state_with_expanded_embedding(self.model, state_dict)
+            return
+        self.model.load_state_dict(state_dict, strict=False)
 
 
 def build_semantic_encoder(parser_name, dataset, args=None):
     if parser_name != 'parser_free':
         raise ValueError('Unsupported parser: %s. Only parser_free is kept in the main pipeline.' % parser_name)
     cache_dir = get_protocol_option(args, 'plm_cache_dir', PARSER_FREE_DEFAULTS['cache_dir'])
-    return ParserFreeEncoder(
+    encoder = ParserFreeEncoder(
         model_name=get_protocol_option(args, 'plm_model', PARSER_FREE_DEFAULTS['model_name']),
         max_length=get_protocol_option(args, 'plm_max_length', PARSER_FREE_DEFAULTS['max_length']),
         batch_size=get_protocol_option(args, 'plm_batch_size', PARSER_FREE_DEFAULTS['batch_size']),
@@ -669,6 +768,9 @@ def build_semantic_encoder(parser_name, dataset, args=None):
         cache_dir=cache_dir if cache_dir else None,
         dataset=dataset,
     )
+    if dataset.upper() == 'SPIRIT':
+        encoder.spirit_max_lines = int(get_protocol_option(args, 'spirit_max_lines', 0) or 0)
+    return encoder
 
 
 def prepare_dataset(dataset, parser_name, semantic_encoder):
@@ -682,11 +784,120 @@ def prepare_dataset(dataset, parser_name, semantic_encoder):
     return processor, instances
 
 
+def prepare_known_mix_protocol_context(parser_name, protocol='clean', args=None):
+    if protocol != 'clean':
+        raise ValueError('Unknown protocol: %s' % protocol)
+
+    hdfs_encoder = build_semantic_encoder(parser_name, 'HDFS', args)
+    hpc_encoder = build_semantic_encoder(parser_name, 'HPC_sr065', args)
+    hdfs_processor, hdfs_instances = prepare_dataset('HDFS', parser_name, hdfs_encoder)
+    hpc_processor, hpc_instances = prepare_dataset('HPC_sr065', parser_name, hpc_encoder)
+
+    clean_config = dict(CLEAN_DIRECTION_CONFIGS['hdfs30_hpc065_known_mix'])
+    source_ratio_override = get_protocol_option(args, 'source_train_ratio', None)
+    hpc_normal_ratio_override = get_protocol_option(args, 'target_normal_ratio', None)
+    hpc_anomaly_ratio_override = get_protocol_option(args, 'target_anomaly_ratio', None)
+    if source_ratio_override is not None:
+        clean_config['source_ratio'] = source_ratio_override
+    if hpc_normal_ratio_override is not None:
+        clean_config['target_normal_ratio'] = hpc_normal_ratio_override
+    if hpc_anomaly_ratio_override is not None:
+        clean_config['target_anomaly_ratio'] = hpc_anomaly_ratio_override
+
+    rng = np.random.RandomState(seed)
+    hdfs_train_raw, hdfs_holdout_raw = split_instances_by_label_ratio(
+        hdfs_instances,
+        clean_config['source_ratio'],
+        rng,
+    )
+    hpc_train_raw, hpc_holdout_raw = split_instances_by_grouped_label_ratios(
+        hpc_instances,
+        clean_config['target_normal_ratio'],
+        clean_config['target_anomaly_ratio'],
+        rng,
+    )
+    target_train_raw = [('HDFS', inst) for inst in hdfs_train_raw] + [('HPC_sr065', inst) for inst in hpc_train_raw]
+    rng.shuffle(target_train_raw)
+
+    dev_ratio = float(get_protocol_option(args, 'known_dev_ratio', 0.1))
+    target_dev_raw = sample_instances_by_label_ratio(
+        [item[1] for item in target_train_raw],
+        dev_ratio,
+        rng,
+    )
+    hdfs_train_ids = {id(inst) for inst in hdfs_train_raw}
+
+    hdfs_embeddings = dict(hdfs_processor.embedding)
+    hpc_embeddings = dict(hpc_processor.embedding)
+    merged_embeddings, domain_mappings = build_merged_embeddings({
+        'HDFS': hdfs_embeddings,
+        'HPC_sr065': hpc_embeddings,
+    })
+
+    mixed_train = []
+    for dataset_name, inst in target_train_raw:
+        mixed_train.extend(remap_instances([inst], domain_mappings[dataset_name]))
+
+    mixed_dev = []
+    for inst in target_dev_raw:
+        dataset_name = 'HDFS' if id(inst) in hdfs_train_ids else 'HPC_sr065'
+        mixed_dev.extend(remap_instances([inst], domain_mappings[dataset_name]))
+
+    hpc_test = remap_instances(hpc_holdout_raw, domain_mappings['HPC_sr065'])
+    hdfs_train = remap_instances(hdfs_train_raw, domain_mappings['HDFS'])
+    hdfs_holdout = remap_instances(hdfs_holdout_raw, domain_mappings['HDFS'])
+
+    vocab = Vocab()
+    vocab.load_from_dict(merged_embeddings)
+    direction = DIRECTION_CONFIGS['hdfs30_hpc065_known_mix']
+    return {
+        'direction': direction,
+        'protocol': protocol,
+        'vocab': vocab,
+        'label2id': hpc_processor.label2id,
+        'source_train': mixed_train,
+        'source_dev': mixed_dev,
+        'target_train': mixed_train,
+        'target_dev': mixed_dev,
+        'target_test': hpc_test if hpc_test else mixed_dev,
+        'selection_split': mixed_dev,
+        'selection_split_name': 'known-mix-dev',
+        'uses_target_training': True,
+        'target_training_mode': 'known_mix_full_hpc_sr065',
+        'warmup_select_by': 'loss',
+        'source_embedding_count': len(hdfs_embeddings) + len(hpc_embeddings),
+        'target_embedding_count': len(hdfs_embeddings) + len(hpc_embeddings),
+        'exact_target_dev_overlap': count_exact_sequence_overlap(mixed_train, mixed_dev),
+        'exact_target_overlap': count_exact_sequence_overlap(mixed_train, hpc_test),
+        'target_dev_oov_events': 0,
+        'target_test_oov_events': 0,
+        'source_persistence_suffix': getattr(hdfs_encoder, 'persistence_suffix', ''),
+        'target_persistence_suffix': getattr(hpc_encoder, 'persistence_suffix', ''),
+        'known_component_counts': {
+            'hdfs30_train': label_summary(hdfs_train),
+            'hdfs_holdout': label_summary(hdfs_holdout),
+            'hpc_sr065_train': label_summary(remap_instances(hpc_train_raw, domain_mappings['HPC_sr065'])),
+            'known_train': label_summary(mixed_train),
+            'known_dev': label_summary(mixed_dev),
+        },
+    }
+
+
 def prepare_protocol_context(direction_key, parser_name, protocol='clean', args=None):
     if parser_name == 'logsynergy_lei_cache':
         return prepare_logsynergy_lei_protocol_context(direction_key, protocol=protocol, args=args)
+    if direction_key == 'hdfs30_hpc065_known_mix':
+        return prepare_known_mix_protocol_context(parser_name, protocol=protocol, args=args)
 
     direction = DIRECTION_CONFIGS[direction_key]
+    source_dataset_override = get_protocol_option(args, 'source_dataset_override', '')
+    target_dataset_override = get_protocol_option(args, 'target_dataset_override', '')
+    if source_dataset_override or target_dataset_override:
+        direction = replace(
+            direction,
+            source_dataset=source_dataset_override or direction.source_dataset,
+            target_dataset=target_dataset_override or direction.target_dataset,
+        )
     source_semantic_encoder = build_semantic_encoder(parser_name, direction.source_dataset, args)
     target_semantic_encoder = build_semantic_encoder(parser_name, direction.target_dataset, args)
 
@@ -703,7 +914,16 @@ def prepare_protocol_context(direction_key, parser_name, protocol='clean', args=
 
     rng = np.random.RandomState(seed)
     if protocol == 'clean':
-        clean_config = CLEAN_DIRECTION_CONFIGS[direction_key]
+        clean_config = dict(CLEAN_DIRECTION_CONFIGS[direction_key])
+        source_ratio_override = get_protocol_option(args, 'source_train_ratio', None)
+        target_normal_ratio_override = get_protocol_option(args, 'target_normal_ratio', None)
+        target_anomaly_ratio_override = get_protocol_option(args, 'target_anomaly_ratio', None)
+        if source_ratio_override is not None:
+            clean_config['source_ratio'] = source_ratio_override
+        if target_normal_ratio_override is not None:
+            clean_config['target_normal_ratio'] = target_normal_ratio_override
+        if target_anomaly_ratio_override is not None:
+            clean_config['target_anomaly_ratio'] = target_anomaly_ratio_override
         source_train_raw, _ = split_instances_by_ratio(source_instances, clean_config['source_ratio'], rng)
         target_train_raw, target_test_raw = split_instances_by_grouped_label_ratios(
             target_instances,
@@ -918,6 +1138,14 @@ def prepare_logsynergy_lei_protocol_context(direction_key, protocol='clean', arg
     if protocol != 'clean':
         raise ValueError('Unknown protocol: %s' % protocol)
     direction = DIRECTION_CONFIGS[direction_key]
+    source_dataset_override = get_protocol_option(args, 'source_dataset_override', '')
+    target_dataset_override = get_protocol_option(args, 'target_dataset_override', '')
+    if source_dataset_override or target_dataset_override:
+        direction = replace(
+            direction,
+            source_dataset=source_dataset_override or direction.source_dataset,
+            target_dataset=target_dataset_override or direction.target_dataset,
+        )
     prepared_root = getattr(args, 'logsynergy_prepared_root', LOGSYNERGY_DEFAULT_PREPARED_ROOT)
     lei_cache_dir = getattr(args, 'logsynergy_lei_cache_dir', LOGSYNERGY_DEFAULT_LEI_CACHE_DIR)
 
@@ -1121,6 +1349,150 @@ def maybe_record_epoch_metrics(args, direction_name, phase_name, epoch, threshol
     })
 
 
+def _known_embeddings_from_vocab(vocab):
+    embeddings = {}
+    for word_id in vocab._id2word:
+        if word_id == '<pad>':
+            continue
+        vocab_index = vocab._word2id[word_id]
+        embeddings[word_id] = vocab.embeddings[vocab_index]
+    return embeddings
+
+
+def _label_counts(instances):
+    normal = sum(1 for inst in instances if inst.label == 'Normal')
+    anomalous = sum(1 for inst in instances if inst.label == 'Anomalous')
+    return normal, anomalous
+
+
+def build_zero_eval_context_from_known(context, zero_target, args):
+    zero_encoder = build_semantic_encoder('parser_free', zero_target, args)
+    zero_processor, zero_instances_raw = prepare_dataset(zero_target, 'parser_free', zero_encoder)
+    known_embeddings = _known_embeddings_from_vocab(context['vocab'])
+    zero_embeddings = dict(zero_processor.embedding)
+    merged_embeddings, domain_mappings = build_merged_embeddings({
+        'known': known_embeddings,
+        zero_target: zero_embeddings,
+    })
+    zero_instances = remap_instances(zero_instances_raw, domain_mappings[zero_target])
+    vocab = Vocab()
+    vocab.load_from_dict(merged_embeddings)
+    zero_normal, zero_anomalous = _label_counts(zero_instances)
+    return {
+        'vocab': vocab,
+        'label2id': zero_processor.label2id,
+        'target_test': zero_instances,
+        'known_event_count': len(known_embeddings),
+        'zero_event_count': len(zero_embeddings),
+        'zero_instance_count': len(zero_instances),
+        'zero_normal_count': zero_normal,
+        'zero_anomalous_count': zero_anomalous,
+    }
+
+
+def build_metalog_for_context(context, args, balance_phase='calibration'):
+    balance_weight = (
+        args.calibration_balance_loss_weight
+        if balance_phase == 'calibration'
+        else args.moe_balance_loss_weight
+    )
+    diversity_weight = (
+        args.calibration_diversity_loss_weight
+        if balance_phase == 'calibration'
+        else args.moe_diversity_loss_weight
+    )
+    return MetaLog(
+        context['vocab'],
+        num_layer,
+        lstm_hiddens,
+        context['label2id'],
+        backbone=args.backbone,
+        dropout=args.dropout,
+        mamba_state=args.mamba_state,
+        mamba_conv=args.mamba_conv,
+        mamba_expand=args.mamba_expand,
+        mamba_variant=args.mamba_variant,
+        use_moe=args.use_moe,
+        moe_num_experts=args.moe_num_experts,
+        moe_top_k=args.moe_top_k,
+        moe_bottleneck_dim=args.moe_bottleneck_dim,
+        moe_temperature=args.moe_temperature,
+        moe_gate_dropout=args.moe_gate_dropout,
+        moe_balance_loss_weight=balance_weight,
+        moe_diversity_loss_weight=diversity_weight,
+        moe_z_loss_weight=args.moe_z_loss_weight,
+        use_normality_anchor=args.use_normality_anchor,
+        prototype_scale=args.prototype_scale,
+        prototype_loss_weight=args.prototype_loss_weight,
+        prototype_sep_weight=args.prototype_sep_weight,
+        prototype_margin_global=args.prototype_margin_global,
+        prototype_margin_expert=args.prototype_margin_expert,
+        prototype_target_normal_only=args.prototype_target_normal_only,
+        router_use_distance=args.router_use_distance,
+        router_distance_mode=args.router_distance_mode,
+        router_distance_scale=args.router_distance_scale,
+        use_global_prototype=args.use_global_prototype,
+        prototype_diversity_margin=args.prototype_diversity_margin,
+    )
+
+
+def load_state_with_expanded_embedding(model, state_dict):
+    model_state = model.state_dict()
+    embed_key = 'word_embed.weight'
+    if embed_key in state_dict and embed_key in model_state:
+        saved_embedding = state_dict[embed_key]
+        current_embedding = model_state[embed_key]
+        if current_embedding.shape[0] >= saved_embedding.shape[0] and current_embedding.shape[1] == saved_embedding.shape[1]:
+            expanded = current_embedding.clone()
+            expanded[:saved_embedding.shape[0]] = saved_embedding
+            state_dict = dict(state_dict)
+            state_dict[embed_key] = expanded
+    model.load_state_dict(state_dict, strict=False)
+
+
+def maybe_record_zero_epoch_metrics(args, context, metalog, phase_name, epoch, threshold, selection_metrics,
+                                    test_metrics, checkpoint_path=''):
+    if not getattr(args, 'zero_epoch_metrics_file', ''):
+        return
+    zero_targets = [item for item in getattr(args, 'zero_epoch_targets', '').split(',') if item.strip()]
+    if not zero_targets:
+        return
+
+    state_dict = type(metalog.model.state_dict())(
+        (key, value.detach().cpu().clone()) for key, value in metalog.model.state_dict().items()
+    )
+    for zero_target in zero_targets:
+        zero_context = build_zero_eval_context_from_known(context, zero_target, args)
+        zero_model = build_metalog_for_context(zero_context, args, balance_phase='calibration')
+        load_state_with_expanded_embedding(zero_model.model, state_dict)
+        metrics = zero_model.evaluate_metrics(zero_context['target_test'], threshold=threshold, vocab=zero_context['vocab'])
+        append_zero_epoch_metrics(args.zero_epoch_metrics_file, {
+            'train_direction': context['direction'].name,
+            'phase': phase_name,
+            'epoch': epoch,
+            'zero_target': zero_target,
+            'method': args.zero_method_name,
+            'precision': '%.6f' % (metrics['precision'] / 100.0),
+            'recall': '%.6f' % (metrics['recall'] / 100.0),
+            'f1': '%.6f' % (metrics['f'] / 100.0),
+            'threshold': '%.8f' % threshold,
+            'threshold_source': context['selection_split_name'],
+            'checkpoint': os.path.abspath(checkpoint_path) if checkpoint_path else '',
+            'total': metrics['TP'] + metrics['TN'] + metrics['FP'] + metrics['FN'],
+            'normal': zero_context['zero_normal_count'],
+            'anomalous': zero_context['zero_anomalous_count'],
+            'tp': metrics['TP'],
+            'tn': metrics['TN'],
+            'fp': metrics['FP'],
+            'fn': metrics['FN'],
+            'known_selection_f1': '%.6f' % (selection_metrics['f'] / 100.0),
+            'known_test_f1': '%.6f' % (test_metrics['f'] / 100.0),
+            'known_event_count': zero_context['known_event_count'],
+            'zero_event_count': zero_context['zero_event_count'],
+            'zero_instance_count': zero_context['zero_instance_count'],
+        })
+
+
 def run_warmup(context, args, checkpoint_prefix, select_by='loss'):
     metalog = MetaLog(
         context['vocab'],
@@ -1133,7 +1505,7 @@ def run_warmup(context, args, checkpoint_prefix, select_by='loss'):
         mamba_conv=args.mamba_conv,
         mamba_expand=args.mamba_expand,
         mamba_variant=args.mamba_variant,
-        use_moe=args.use_normality_anchor,
+        use_moe=args.use_moe,
         moe_num_experts=args.moe_num_experts,
         moe_top_k=args.moe_top_k,
         moe_bottleneck_dim=args.moe_bottleneck_dim,
@@ -1150,6 +1522,10 @@ def run_warmup(context, args, checkpoint_prefix, select_by='loss'):
         prototype_margin_expert=args.prototype_margin_expert,
         prototype_target_normal_only=args.prototype_target_normal_only,
         router_use_distance=args.router_use_distance,
+        router_distance_mode=args.router_distance_mode,
+        router_distance_scale=args.router_distance_scale,
+        use_global_prototype=args.use_global_prototype,
+        prototype_diversity_margin=args.prototype_diversity_margin,
     )
     optimizer = build_warmup_optimizer(metalog, args)
     best_value = None
@@ -1195,6 +1571,17 @@ def run_warmup(context, args, checkpoint_prefix, select_by='loss'):
             is_best,
             phase_mean_loss=mean_loss,
         )
+        maybe_record_zero_epoch_metrics(
+            args,
+            context,
+            metalog,
+            'phase_a',
+            epoch,
+            threshold,
+            selection_metrics,
+            test_metrics,
+            checkpoint_path=last_checkpoint,
+        )
         if is_best:
             best_value = current_value
             save_model_state(metalog.model, best_checkpoint)
@@ -1214,7 +1601,7 @@ def run_joint_finetune(context, args, checkpoint_prefix, warmup_checkpoint):
         mamba_conv=args.mamba_conv,
         mamba_expand=args.mamba_expand,
         mamba_variant=args.mamba_variant,
-        use_moe=True,
+        use_moe=args.use_moe,
         moe_num_experts=args.moe_num_experts,
         moe_top_k=args.moe_top_k,
         moe_bottleneck_dim=args.moe_bottleneck_dim,
@@ -1231,6 +1618,10 @@ def run_joint_finetune(context, args, checkpoint_prefix, warmup_checkpoint):
         prototype_margin_expert=args.prototype_margin_expert,
         prototype_target_normal_only=args.prototype_target_normal_only,
         router_use_distance=args.router_use_distance,
+        router_distance_mode=args.router_distance_mode,
+        router_distance_scale=args.router_distance_scale,
+        use_global_prototype=args.use_global_prototype,
+        prototype_diversity_margin=args.prototype_diversity_margin,
     )
     partial_load_state_dict(metalog.model, warmup_checkpoint, metalog.logger)
     optimizer = build_joint_optimizer(metalog, args)
@@ -1279,6 +1670,17 @@ def run_joint_finetune(context, args, checkpoint_prefix, warmup_checkpoint):
             test_metrics,
             is_best,
         )
+        maybe_record_zero_epoch_metrics(
+            args,
+            context,
+            metalog,
+            'phase_b',
+            epoch,
+            threshold,
+            selection_metrics,
+            test_metrics,
+            checkpoint_path=last_checkpoint,
+        )
         if is_best:
             best_selection_f = selection_metrics['f']
             best_threshold = threshold
@@ -1300,7 +1702,7 @@ def run_calibration(context, args, checkpoint_prefix, joint_checkpoint):
         mamba_conv=args.mamba_conv,
         mamba_expand=args.mamba_expand,
         mamba_variant=args.mamba_variant,
-        use_moe=True,
+        use_moe=args.use_moe,
         moe_num_experts=args.moe_num_experts,
         moe_top_k=args.moe_top_k,
         moe_bottleneck_dim=args.moe_bottleneck_dim,
@@ -1317,6 +1719,10 @@ def run_calibration(context, args, checkpoint_prefix, joint_checkpoint):
         prototype_margin_expert=args.prototype_margin_expert,
         prototype_target_normal_only=args.prototype_target_normal_only,
         router_use_distance=args.router_use_distance,
+        router_distance_mode=args.router_distance_mode,
+        router_distance_scale=args.router_distance_scale,
+        use_global_prototype=args.use_global_prototype,
+        prototype_diversity_margin=args.prototype_diversity_margin,
     )
     metalog.load_model_state(joint_checkpoint)
     set_parameter_trainability(metalog.model.backbone_parameters(), False)
@@ -1369,6 +1775,17 @@ def run_calibration(context, args, checkpoint_prefix, joint_checkpoint):
             test_metrics,
             is_best,
         )
+        maybe_record_zero_epoch_metrics(
+            args,
+            context,
+            metalog,
+            'phase_c',
+            epoch,
+            threshold,
+            selection_metrics,
+            test_metrics,
+            checkpoint_path=last_checkpoint,
+        )
         if is_best:
             best_selection_f = selection_metrics['f']
             best_threshold = threshold
@@ -1407,6 +1824,10 @@ def final_evaluate(context, args, checkpoint_path, threshold, use_moe=True):
         prototype_margin_expert=args.prototype_margin_expert,
         prototype_target_normal_only=args.prototype_target_normal_only,
         router_use_distance=args.router_use_distance,
+        router_distance_mode=args.router_distance_mode,
+        router_distance_scale=args.router_distance_scale,
+        use_global_prototype=args.use_global_prototype,
+        prototype_diversity_margin=args.prototype_diversity_margin,
     )
     metalog.load_model_state(checkpoint_path)
     metrics = metalog.evaluate_metrics(context['target_test'], threshold=threshold, vocab=context['vocab'])
@@ -1450,6 +1871,18 @@ def build_arg_parser():
     parser.add_argument('--protocol', type=str, default='clean',
                         choices=['clean'],
                         help='Data split protocol.')
+    parser.add_argument('--source_train_ratio', type=float, default=None,
+                        help='Override clean-protocol source-domain train ratio.')
+    parser.add_argument('--target_normal_ratio', type=float, default=None,
+                        help='Override clean-protocol target normal train ratio.')
+    parser.add_argument('--target_anomaly_ratio', type=float, default=None,
+                        help='Override clean-protocol target anomaly train ratio.')
+    parser.add_argument('--source_dataset_override', type=str, default='',
+                        help='Optional dataset name override for the source side when rebuilding a saved checkpoint context.')
+    parser.add_argument('--target_dataset_override', type=str, default='',
+                        help='Optional dataset name override for the target side when rebuilding a saved checkpoint context.')
+    parser.add_argument('--known_dev_ratio', type=float, default=0.1,
+                        help='For known-mix zero-shot, sample this fraction of known training data for threshold selection while keeping it in training.')
     parser.add_argument('--plm_model', type=str, default=PARSER_FREE_DEFAULTS['model_name'],
                         help='Hugging Face model name used by parser-free encoding.')
     parser.add_argument('--plm_max_length', type=int, default=PARSER_FREE_DEFAULTS['max_length'],
@@ -1460,6 +1893,8 @@ def build_arg_parser():
                         choices=['mean', 'cls'], help='Pooling strategy for parser-free log encoding.')
     parser.add_argument('--plm_cache_dir', type=str, default=PARSER_FREE_DEFAULTS['cache_dir'],
                         help='Optional cache directory for parser-free text embeddings.')
+    parser.add_argument('--spirit_max_lines', type=int, default=0,
+                        help='Optional maximum number of SPIRIT raw lines to stream when building test-only data.')
     parser.add_argument('--logsynergy_prepared_root', type=str, default=LOGSYNERGY_DEFAULT_PREPARED_ROOT,
                         help='LogSynergy prepared parser-output root used by --parser logsynergy_lei_cache.')
     parser.add_argument('--logsynergy_lei_cache_dir', type=str, default=LOGSYNERGY_DEFAULT_LEI_CACHE_DIR,
@@ -1513,6 +1948,12 @@ def build_arg_parser():
                         help='Checkpoint path used when mode=test.')
     parser.add_argument('--epoch_metrics_file', type=str, default='',
                         help='Optional CSV file for per-epoch target-test metrics.')
+    parser.add_argument('--zero_epoch_metrics_file', type=str, default='',
+                        help='Optional CSV file for per-epoch OpenStack/SPIRIT zero-shot metrics.')
+    parser.add_argument('--zero_epoch_targets', type=str, default='',
+                        help='Comma-separated zero-shot targets to evaluate after every epoch, e.g. OpenStack,SPIRIT.')
+    parser.add_argument('--zero_method_name', type=str, default='MetaLog',
+                        help='Method label used in zero-shot epoch metrics CSV.')
     parser.add_argument('--moe_num_experts', type=int, default=4, help='Number of latent experts.')
     parser.add_argument('--moe_top_k', type=int, default=2, help='Top-k routed experts.')
     parser.add_argument('--moe_bottleneck_dim', type=int, default=0,
@@ -1529,6 +1970,10 @@ def build_arg_parser():
                         help='Phase C MoE diversity loss weight.')
     parser.add_argument('--moe_z_loss_weight', type=float, default=0.0,
                         help='Optional router z-loss weight.')
+    parser.add_argument('--use-moe', dest='use_moe', action='store_true',
+                        help='Enable the latent MoE classification head.')
+    parser.add_argument('--no-use-moe', dest='use_moe', action='store_false',
+                        help='Disable the latent MoE head and use the base BiMamba classifier.')
     parser.add_argument('--use-normality-anchor', dest='use_normality_anchor', action='store_true',
                         help='Enable normality-anchored drift-aware MoE head.')
     parser.add_argument('--no-use-normality-anchor', dest='use_normality_anchor', action='store_false',
@@ -1552,10 +1997,23 @@ def build_arg_parser():
                         help='Use prototype distance and feature norm in router inputs.')
     parser.add_argument('--no-router-use-distance', dest='router_use_distance', action='store_false',
                         help='Disable distance-aware router features.')
+    parser.add_argument('--router-distance-mode', type=str, default='expert_bias',
+                        choices=['none', 'global_concat', 'expert_concat', 'expert_bias', 'expert_concat_bias'],
+                        help='How prototype distances are injected into the router.')
+    parser.add_argument('--router-distance-scale', type=float, default=1.0,
+                        help='Scale for expert-wise prototype-distance bias on router logits.')
+    parser.add_argument('--use-global-prototype', dest='use_global_prototype', action='store_true',
+                        help='Keep a shared global prototype in addition to expert prototypes.')
+    parser.add_argument('--no-use-global-prototype', dest='use_global_prototype', action='store_false',
+                        help='Disable the shared global prototype and rely on expert prototypes only.')
+    parser.add_argument('--prototype-diversity-margin', type=float, default=0.5,
+                        help='Margin used by prototype diversity regularization.')
     parser.set_defaults(
+        use_moe=True,
         use_normality_anchor=True,
         prototype_target_normal_only=True,
         router_use_distance=True,
+        use_global_prototype=False,
     )
     return parser
 
@@ -1646,7 +2104,7 @@ def run_direction(direction_key, args):
         if not checkpoint_path:
             raise ValueError('mode=test requires --checkpoint.')
         threshold = args.threshold
-        use_moe = context['uses_target_training'] or args.use_normality_anchor
+        use_moe = args.use_moe
         if args.auto_threshold:
             evaluator = MetaLog(
                 context['vocab'],
@@ -1704,7 +2162,7 @@ def run_direction(direction_key, args):
                 mamba_conv=args.mamba_conv,
                 mamba_expand=args.mamba_expand,
                 mamba_variant=args.mamba_variant,
-                use_moe=args.use_normality_anchor,
+                use_moe=args.use_moe,
                 moe_num_experts=args.moe_num_experts,
                 moe_top_k=args.moe_top_k,
                 moe_bottleneck_dim=args.moe_bottleneck_dim,
@@ -1731,7 +2189,7 @@ def run_direction(direction_key, args):
                 threshold_step=args.threshold_step,
                 split_name=context['selection_split_name'],
             )
-        final_evaluate(context, args, warmup_checkpoint, threshold, use_moe=args.use_normality_anchor)
+        final_evaluate(context, args, warmup_checkpoint, threshold, use_moe=args.use_moe)
         return
 
     _, _, joint_last_checkpoint = run_joint_finetune(context, args, checkpoint_prefix, warmup_checkpoint)
@@ -1741,4 +2199,4 @@ def run_direction(direction_key, args):
         checkpoint_prefix,
         joint_last_checkpoint,
     )
-    final_evaluate(context, args, calibration_checkpoint, calibration_threshold, use_moe=True)
+    final_evaluate(context, args, calibration_checkpoint, calibration_threshold, use_moe=args.use_moe)
